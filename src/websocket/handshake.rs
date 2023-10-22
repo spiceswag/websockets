@@ -3,10 +3,11 @@ use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use regex::Regex;
 use sha1::{Digest, Sha1};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, WriteHalf};
+use tokio_util::codec::FramedWrite;
 
-use super::parsed_addr::ParsedAddr;
-use crate::{error::WebSocketError, WebSocket};
+use super::{frame::WsFrameCodec, parsed_addr::ParsedAddr, stream::Stream};
+use crate::{batched::Batched, error::WebSocketError, Frame, WebSocket};
 
 const GUUID: &'static str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -70,14 +71,20 @@ impl Handshake {
         }
         req.push_str("\r\n"); // end of request
 
-        ws.write_half
+        ws.inner
+            .write
             .stream
+            .get_mut()
             .get_mut()
             .write_all(req.as_bytes())
             .await
             .map_err(|e| WebSocketError::WriteError(e))?;
         // flushing on the framed write is equivalent with flushing the raw stream
-        ws.write_half.stream.flush().await.map_err(|err| err.0)?;
+        <Batched<FramedWrite<WriteHalf<Stream>, WsFrameCodec>, Frame> as SinkExt<Frame>>::flush(
+            &mut ws.inner.write.stream,
+        )
+        .await
+        .map_err(|err| err.0)?;
         Ok(())
     }
 
@@ -87,7 +94,8 @@ impl Handshake {
         let status_line_regex = Regex::new(r"HTTP/\d+\.\d+ (?P<status_code>\d{3}) .+\r\n").unwrap();
         let mut status_line = String::new();
 
-        ws.read_half
+        ws.inner
+            .read
             .stream
             .get_mut()
             .read_line(&mut status_line)
@@ -102,7 +110,8 @@ impl Handshake {
         let headers_regex = Regex::new(r"(?P<field>.+?):\s*(?P<value>.*?)\s*\r\n").unwrap();
         loop {
             let mut header = String::new();
-            ws.read_half
+            ws.inner
+                .read
                 .stream
                 .get_mut()
                 .read_line(&mut header)
@@ -130,7 +139,8 @@ impl Handshake {
                         .parse::<usize>()
                         .map_err(|_e| WebSocketError::InvalidHandshakeError)?;
                     let mut body = vec![0; body_length];
-                    ws.read_half
+                    ws.inner
+                        .read
                         .stream
                         .get_mut()
                         .read_exact(&mut body)

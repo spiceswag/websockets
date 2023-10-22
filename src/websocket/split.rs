@@ -11,7 +11,8 @@ use super::message::{Fragmentation, Message};
 use super::stream::Stream as Socket;
 #[allow(unused_imports)] // for intra doc links
 use super::WebSocket;
-use crate::error::WebSocketError;
+use crate::batched::{Batched, Prioritized};
+use crate::error::{WebSocketError, WsWriteError};
 
 /// Events sent from the read half to the write half
 #[derive(Debug)]
@@ -80,7 +81,7 @@ impl Stream for WebSocketReadHalf {
                 continuation,
                 fin,
             } => {
-                let complete = match self.partial_message {
+                let complete = match self.partial_message.take() {
                     Some(Message::Binary(mut prev_payloads)) if continuation => {
                         prev_payloads.extend(payload);
                         prev_payloads
@@ -101,7 +102,7 @@ impl Stream for WebSocketReadHalf {
                 continuation,
                 fin,
             } => {
-                let complete = match self.partial_message {
+                let complete = match self.partial_message.take() {
                     Some(Message::Text(mut prev_payloads)) if continuation => {
                         prev_payloads.extend(payload.chars());
                         prev_payloads
@@ -133,7 +134,7 @@ impl Stream for WebSocketReadHalf {
 ///
 #[derive(Debug)]
 pub struct WebSocketWriteHalf {
-    pub(super) stream: FramedWrite<WriteHalf<Socket>, WsFrameCodec>,
+    pub(super) stream: Batched<FramedWrite<WriteHalf<Socket>, WsFrameCodec>, Frame>,
     pub(super) fragmentation: Fragmentation,
 
     pub(super) receiver: Receiver<Event>,
@@ -222,14 +223,14 @@ impl WebSocketWriteHalf {
 impl Sink<Message> for WebSocketWriteHalf {
     type Error = WebSocketError;
 
-    fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+    fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
         if self.shutdown || self.sent_closed {
             return Err(WebSocketError::WebSocketClosedError);
         }
 
         let frames = self.fragmentation.fragment(item);
 
-        todo!()
+        self.stream.start_send_unpin(frames).map_err(|err| err.0)
     }
 
     fn poll_ready(
@@ -243,7 +244,12 @@ impl Sink<Message> for WebSocketWriteHalf {
         // try to feed events into the sink
         while let Ok(event) = self.receiver.try_recv() {
             // make sure we're ready for feeding
-            match self.stream.poll_ready_unpin(cx).map_err(|err| err.0) {
+            match <Batched::<FramedWrite<WriteHalf<Socket>, WsFrameCodec>, Frame> as SinkExt<Frame>>::poll_ready_unpin(
+                &mut self.stream,
+                cx,
+            )
+                .map_err(|err: WsWriteError| err.0)
+            {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                 _ => {}
@@ -251,14 +257,20 @@ impl Sink<Message> for WebSocketWriteHalf {
 
             match event {
                 Event::SendPongFrame(frame) => {
-                    self.stream.start_send_unpin(frame).map_err(|err| err.0)?
+                    //  events get priority over other frames \/\/\/
+                    self.stream
+                        .start_send_unpin(Prioritized(frame))
+                        .map_err(|err| err.0)?
                 }
                 Event::SendCloseFrameAndShutdown(frame) => {
                     // read half will always send this event if it has received a close frame,
                     // but if we have sent one already, then we have sent and received a close
                     // frame, so we will shutdown
                     if self.sent_closed {
-                        self.stream.start_send_unpin(frame).map_err(|err| err.0)?;
+                        //     events get priority \/\/\/
+                        self.stream
+                            .start_send_unpin(Prioritized(frame))
+                            .map_err(|err| err.0)?;
 
                         // Not needed because we're already trying to close the sink when the shutdown flag is up
                         // self.drop().await?;
@@ -270,14 +282,23 @@ impl Sink<Message> for WebSocketWriteHalf {
         // The fact that we poll twice before a send
         // introduces a sort of dos attack where the server spams
         // pings and we can't send any actual data in return.
-        self.stream.poll_ready_unpin(cx).map_err(|err| err.0)
+
+        <Batched::<FramedWrite<WriteHalf<Socket>, WsFrameCodec>, Frame> as SinkExt<Frame>>::poll_ready_unpin(
+            &mut self.stream,
+            cx,
+        )
+        .map_err(|err| err.0)
     }
 
     fn poll_flush(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
-        self.stream.poll_flush_unpin(cx).map_err(|err| err.0)
+        <Batched::<FramedWrite<WriteHalf<Socket>, WsFrameCodec>, Frame> as SinkExt<Frame>>::poll_flush_unpin(
+            &mut self.stream,
+            cx,
+        )
+            .map_err(|err| err.0)
     }
 
     fn poll_close(
@@ -285,8 +306,10 @@ impl Sink<Message> for WebSocketWriteHalf {
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
         // this is not that undesired considering you can just call WebSocketWriteHalf::drop
-        self.stream
-            .poll_close_unpin(cx)
+        <Batched::<FramedWrite<WriteHalf<Socket>, WsFrameCodec>, Frame> as SinkExt<Frame>>::poll_close_unpin(
+            &mut self.stream,
+            cx,
+        )
             .map_err(|err| err.0)
             .map_err(|err| match err {
                 // From<std::io::Error> (used by Framed) yields this type of error so we have to transform it to shutdown error

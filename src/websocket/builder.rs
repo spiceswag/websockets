@@ -14,7 +14,8 @@ use super::message::Fragmentation;
 use super::parsed_addr::ParsedAddr;
 use super::split::{WebSocketReadHalf, WebSocketWriteHalf};
 use super::stream::Stream;
-use super::WebSocket;
+use super::{FlushingWs, WebSocket};
+use crate::batched::Batched;
 use crate::error::WebSocketError;
 use crate::secure::{TlsCertificate, TlsIdentity, TlsProtocol};
 
@@ -85,17 +86,20 @@ impl WebSocketBuilder {
         let (read_half, write_half) = io::split(stream);
         let (sender, receiver) = flume::unbounded();
         let mut ws = WebSocket {
-            read_half: WebSocketReadHalf {
-                stream: FramedRead::new(BufReader::new(read_half), WsFrameCodec::new()),
-                sender,
-                partial_message: None,
-            },
-            write_half: WebSocketWriteHalf {
-                stream: FramedWrite::new(write_half, WsFrameCodec::new()),
-                fragmentation: self.fragmentation,
-                receiver,
-                shutdown: false,
-                sent_closed: false,
+            inner: FlushingWs {
+                read: WebSocketReadHalf {
+                    stream: FramedRead::new(BufReader::new(read_half), WsFrameCodec::new()),
+                    sender,
+                    partial_message: None,
+                },
+                write: WebSocketWriteHalf {
+                    stream: Batched::new(FramedWrite::new(write_half, WsFrameCodec::new()), 16),
+                    fragmentation: self.fragmentation,
+                    receiver,
+                    shutdown: false,
+                    sent_closed: false,
+                },
+                received_message: None,
             },
             accepted_subprotocol: None,
             handshake_response_headers: None,
@@ -117,6 +121,8 @@ impl WebSocketBuilder {
         }
     }
 
+    /// Define the fragmentation strategy employed by this websocket.
+    /// Defaults to doing no fragmentation and praying no frames exceed the peer's limit.
     pub fn fragmentation(mut self, strategy: Fragmentation) -> Self {
         self.fragmentation = strategy;
         self

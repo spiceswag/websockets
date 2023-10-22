@@ -6,10 +6,14 @@ mod parsed_addr;
 pub mod split;
 mod stream;
 
+use std::task::{ready, Poll};
+
 use crate::error::WebSocketError;
 use builder::WebSocketBuilder;
-use frame::Frame;
+use futures::{Sink, SinkExt, Stream, StreamExt};
 use split::{WebSocketReadHalf, WebSocketWriteHalf};
+
+use self::message::Message;
 
 #[derive(Debug)]
 enum FrameType {
@@ -115,8 +119,8 @@ impl Default for FrameType {
 /// Flushing is done automatically if you are using the the `WebSocket` type by itself.
 #[derive(Debug)]
 pub struct WebSocket {
-    read_half: WebSocketReadHalf,
-    write_half: WebSocketWriteHalf,
+    inner: FlushingWs,
+
     accepted_subprotocol: Option<String>,
     handshake_response_headers: Option<Vec<(String, String)>>,
 }
@@ -138,15 +142,12 @@ impl WebSocket {
     /// If the received frame is a Ping frame, a Pong frame will be sent.
     /// If the received frame is a Close frame, an echoed Close frame
     /// will be sent and the WebSocket will close.
-    pub async fn receive(&mut self) -> Result<Frame, WebSocketError> {
-        let received_frame = self.read_half.receive().await?;
-        self.write_half.flush().await?;
-        Ok(received_frame)
-    }
-
-    /// Sends an already constructed [`Frame`] over the WebSocket connection.
-    pub async fn send(&mut self, frame: Frame) -> Result<(), WebSocketError> {
-        self.write_half.send(frame).await
+    pub async fn receive(&mut self) -> Result<Message, WebSocketError> {
+        match <Self as StreamExt>::next(self).await {
+            Some(Ok(v)) => Ok(v),
+            Some(Err(err)) => Err(err),
+            None => Err(WebSocketError::WebSocketClosedError),
+        }
     }
 
     /// Sends a Text frame over the WebSocket connection, constructed
@@ -154,7 +155,7 @@ impl WebSocket {
     /// To use a custom `continuation` or `fin`, construct a [`Frame`] and use
     /// [`WebSocket::send()`].
     pub async fn send_text(&mut self, payload: String) -> Result<(), WebSocketError> {
-        self.write_half.send_text(payload).await
+        self.send(Message::Text(payload)).await
     }
 
     /// Sends a Binary frame over the WebSocket connection, constructed
@@ -162,7 +163,7 @@ impl WebSocket {
     /// To use a custom `continuation` or `fin`, construct a [`Frame`] and use
     /// [`WebSocket::send()`].
     pub async fn send_binary(&mut self, payload: Vec<u8>) -> Result<(), WebSocketError> {
-        self.write_half.send_binary(payload).await
+        self.send(Message::Binary(payload)).await
     }
 
     /// Sends a Close frame over the WebSocket connection, constructed
@@ -170,19 +171,19 @@ impl WebSocket {
     /// This method will attempt to wait for an echoed Close frame,
     /// which is returned.
     pub async fn close(&mut self, payload: Option<(u16, String)>) -> Result<(), WebSocketError> {
-        self.write_half.close(payload).await
+        self.inner.write.close(payload).await
     }
 
     /// Sends a Ping frame over the WebSocket connection, constructed
     /// from passed arguments.
     pub async fn send_ping(&mut self, payload: Option<Vec<u8>>) -> Result<(), WebSocketError> {
-        self.write_half.send_ping(payload).await
+        todo!()
     }
 
     /// Shuts down the WebSocket connection **without sending a Close frame**.
     /// It is recommended to use the [`close()`](WebSocket::close()) method instead.
     pub async fn drop(&mut self) -> Result<(), WebSocketError> {
-        self.write_half.drop().await
+        self.inner.write.drop().await
     }
 
     /// Splits the WebSocket into a read half and a write half, which can be used separately.
@@ -190,14 +191,17 @@ impl WebSocket {
     /// and [handshake response headers](WebSocket::handshake_response_headers()) data
     /// will be lost.
     pub fn split(self) -> (WebSocketReadHalf, WebSocketWriteHalf) {
-        (self.read_half, self.write_half)
+        (self.inner.read, self.inner.write)
     }
 
     /// Joins together a split read half and write half to reconstruct a WebSocket.
     pub fn join(read_half: WebSocketReadHalf, write_half: WebSocketWriteHalf) -> Self {
         Self {
-            read_half,
-            write_half,
+            inner: FlushingWs {
+                read: read_half,
+                write: write_half,
+                received_message: None,
+            },
             accepted_subprotocol: None,
             handshake_response_headers: None,
         }
@@ -215,5 +219,77 @@ impl WebSocket {
     pub fn handshake_response_headers(&self) -> &Option<Vec<(String, String)>> {
         // https://tools.ietf.org/html/rfc6455#section-4.2.2
         &self.handshake_response_headers
+    }
+}
+
+impl Stream for WebSocket {
+    type Item = Result<Message, WebSocketError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        self.inner.poll_next_unpin(cx)
+    }
+}
+
+impl Sink<Message> for WebSocket {
+    type Error = <WebSocketWriteHalf as Sink<Message>>::Error;
+
+    fn start_send(mut self: std::pin::Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+        self.inner.write.start_send_unpin(item)
+    }
+
+    fn poll_ready(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.write.poll_ready_unpin(cx)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.write.poll_flush_unpin(cx)
+    }
+
+    fn poll_close(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.write.poll_close_unpin(cx)
+    }
+}
+
+#[derive(Debug)]
+struct FlushingWs {
+    pub read: WebSocketReadHalf,
+    pub write: WebSocketWriteHalf,
+
+    pub received_message: Option<Message>,
+}
+
+impl Stream for FlushingWs {
+    type Item = Result<Message, WebSocketError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.received_message.is_none() {
+            self.received_message = match ready!(self.read.poll_next_unpin(cx)) {
+                Some(Ok(res)) => Some(res),
+                Some(Err(err)) => return Poll::Ready(Some(Err(err))),
+                None => return Poll::Ready(None),
+            }
+        };
+
+        ready!(self.write.poll_flush_unpin(cx))?;
+
+        Poll::Ready(Some(Ok(self
+            .received_message
+            .take()
+            .unwrap_or_else(|| unreachable!()))))
     }
 }

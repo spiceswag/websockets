@@ -116,7 +116,7 @@ impl Decoder for WsFrameCodec {
         std::io::Read::read(&mut src, &mut payload).unwrap();
 
         let consumed = src.position() as usize;
-        src.into_inner().split_to(consumed);
+        let _ = src.into_inner().split_to(consumed);
 
         match opcode {
             // continuation frame
@@ -272,22 +272,8 @@ impl Encoder<Frame> for WsFrameCodec {
 // https://tools.ietf.org/html/rfc6455#section-5.2
 /// Data which is sent and received through the WebSocket connection.
 ///
-/// # Sending
-///
-/// To send a Frame, you can construct it normally and use the [`WebSocket::send()`] method,
-/// or use the convenience methods for each frame type
-/// ([`send_text()`](WebSocket::send_text()), [`send_binary()`](WebSocket::send_binary()),
-/// [`close()`](WebSocket::close()), [`send_ping()`](WebSocket::send_ping()),
-/// and [`send_pong()`](WebSocket::send_pong())).
-///
-/// # Receiving
-///
-/// Frames can be received through the [`WebSocket::receive()`] method.
-/// To extract the underlying data from a received Frame,
-/// you can `match` or use the convenience methods—for example, for text frames,
-/// you can use the method [`as_text`](Frame::as_text()) to get an immutable reference
-/// to the data, [`as_text_mut`](Frame::as_text_mut()) to get a mutable reference to the data,
-/// or [`into_text`](Frame::into_text()) to get ownership of the data.
+/// Sending and receiving raw frames is inaccessible in the public API,
+/// due to protocol integrity concerns, send messages or fragments instead.
 ///
 /// # Fragmentation
 ///

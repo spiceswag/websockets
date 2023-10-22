@@ -1,3 +1,4 @@
+use futures::SinkExt;
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use regex::Regex;
@@ -5,8 +6,7 @@ use sha1::{Digest, Sha1};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
 use super::parsed_addr::ParsedAddr;
-use super::WebSocket;
-use crate::error::WebSocketError;
+use crate::{error::WebSocketError, WebSocket};
 
 const GUUID: &'static str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -21,7 +21,7 @@ pub(super) struct Handshake {
 }
 
 impl Handshake {
-    pub(super) fn new(
+    pub fn new(
         parsed_addr: &ParsedAddr,
         additional_handshake_headers: &Vec<(String, String)>,
         subprotocols: &Vec<String>,
@@ -42,7 +42,7 @@ impl Handshake {
         }
     }
 
-    pub(super) async fn send_request(&self, ws: &mut WebSocket) -> Result<(), WebSocketError> {
+    pub async fn send_request(&self, ws: &mut WebSocket) -> Result<(), WebSocketError> {
         // https://tools.ietf.org/html/rfc6455#section-1.3
         // https://tools.ietf.org/html/rfc6455#section-4.1
         let mut headers = Vec::new();
@@ -69,20 +69,19 @@ impl Handshake {
             req.push_str(&format!("{}: {}\r\n", field, value));
         }
         req.push_str("\r\n"); // end of request
+
         ws.write_half
             .stream
+            .get_mut()
             .write_all(req.as_bytes())
             .await
             .map_err(|e| WebSocketError::WriteError(e))?;
-        ws.write_half
-            .stream
-            .flush()
-            .await
-            .map_err(|e| WebSocketError::WriteError(e))?;
+        // flushing on the framed write is equivalent with flushing the raw stream
+        ws.write_half.stream.flush().await.map_err(|err| err.0)?;
         Ok(())
     }
 
-    pub(super) async fn check_response(&self, ws: &mut WebSocket) -> Result<(), WebSocketError> {
+    pub async fn check_response(&self, ws: &mut WebSocket) -> Result<(), WebSocketError> {
         // https://tools.ietf.org/html/rfc6455#section-1.3
         // https://tools.ietf.org/html/rfc6455#section-4.2.2
         let status_line_regex = Regex::new(r"HTTP/\d+\.\d+ (?P<status_code>\d{3}) .+\r\n").unwrap();
@@ -90,6 +89,7 @@ impl Handshake {
 
         ws.read_half
             .stream
+            .get_mut()
             .read_line(&mut status_line)
             .await
             .map_err(|e| WebSocketError::ReadError(e))?;
@@ -104,6 +104,7 @@ impl Handshake {
             let mut header = String::new();
             ws.read_half
                 .stream
+                .get_mut()
                 .read_line(&mut header)
                 .await
                 .map_err(|e| WebSocketError::ReadError(e))?;
@@ -131,6 +132,7 @@ impl Handshake {
                     let mut body = vec![0; body_length];
                     ws.read_half
                         .stream
+                        .get_mut()
                         .read_exact(&mut body)
                         .await
                         .map_err(|e| WebSocketError::ReadError(e))?;

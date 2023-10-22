@@ -1,17 +1,273 @@
 use std::convert::TryInto;
 
-use rand::RngCore;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use rand::{RngCore, SeedableRng};
+use rand_chacha::ChaCha20Rng;
+use tokio_util::bytes::BytesMut;
+use tokio_util::codec::{Decoder, Encoder};
 
-use super::split::{WebSocketReadHalf, WebSocketWriteHalf};
 use super::FrameType;
 #[allow(unused_imports)] // for intra doc links
 use super::WebSocket;
-use crate::error::WebSocketError;
+use crate::error::{WebSocketError, WsReadError, WsWriteError};
 
 const U16_MAX_MINUS_ONE: usize = (u16::MAX - 1) as usize;
 const U16_MAX: usize = u16::MAX as usize;
 const U64_MAX_MINUS_ONE: usize = (u64::MAX - 1) as usize;
+
+/// Max payload size in bytes
+const MAX_PAYLOAD_SIZE: usize = 2_000_000; // 2 MB
+
+/// Send and receive WebSocket frames over the beloved [`Stream`] and [`Sink`] traits.
+///
+/// [`Stream`]: futures::Stream
+/// [`Sink`]: futures::Sink
+#[derive(Debug)]
+pub(crate) struct WsFrameCodec {
+    // receive
+    last_frame_type: Option<FrameType>,
+    // send
+    rng: ChaCha20Rng,
+}
+
+impl WsFrameCodec {
+    /// Create a WebSocket frame decoder.
+    pub fn new() -> Self {
+        Self {
+            last_frame_type: None,
+            rng: ChaCha20Rng::from_entropy(),
+        }
+    }
+}
+
+impl Decoder for WsFrameCodec {
+    type Item = Frame;
+    type Error = WsReadError;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        use std::io::Cursor;
+        if src.len() < 2 {
+            // 16 bits
+            return Ok(None);
+        }
+
+        let mut src = Cursor::new(src);
+
+        fn read_u8<T: std::io::Read>(t: &mut T) -> Result<u8, std::io::Error> {
+            let mut buf = [0; 1];
+            t.read(&mut buf)?;
+            Ok(buf[0])
+        }
+
+        let (fin, opcode) = {
+            let byte = read_u8(&mut src).unwrap();
+
+            let fin = byte & 0b10000000_u8 != 0;
+            let opcode = byte & 0b00001111_u8;
+
+            (fin, opcode)
+        };
+        let (masked, length_specifier) = {
+            let byte = read_u8(&mut src).unwrap();
+
+            let masked = byte & 0b10000000_u8 != 0;
+            let length = (byte & 0b01111111_u8) << 1;
+
+            (masked, length)
+        };
+
+        if masked {
+            return Err(WsReadError(WebSocketError::ReceivedMaskedFrameError));
+        }
+
+        let payload_length = match length_specifier {
+            0..=125 => length_specifier as usize,
+            126 => {
+                if src.get_ref().len() < 4 {
+                    // 32 bits
+                    return Ok(None);
+                }
+
+                let mut buf = [0; 2];
+                std::io::Read::read(&mut src, &mut buf).unwrap();
+                u16::from_be_bytes(buf) as usize
+            }
+            127 => {
+                if src.get_ref().len() < 10 {
+                    // 80 bits
+                    return Ok(None);
+                }
+
+                let mut buf = [0; 8];
+                std::io::Read::read(&mut src, &mut buf).unwrap();
+                u64::from_be_bytes(buf) as usize
+            }
+            _ => return Err(WsReadError(WebSocketError::InvalidFrameError)),
+        };
+
+        if payload_length > MAX_PAYLOAD_SIZE {
+            return Err(WsReadError(WebSocketError::PayloadTooLargeError));
+        }
+
+        if src.get_ref().len() < src.position() as usize + payload_length {
+            return Ok(None);
+        }
+
+        let mut payload = vec![0u8; payload_length];
+        std::io::Read::read(&mut src, &mut payload).unwrap();
+
+        let consumed = src.position() as usize;
+        src.into_inner().split_to(consumed);
+
+        match opcode {
+            // continuation frame
+            0x0 => match self.last_frame_type {
+                Some(FrameType::Text) => {
+                    if fin {
+                        self.last_frame_type = None;
+                    }
+
+                    Ok(Some(Frame::Text {
+                        payload: String::from_utf8(payload)
+                            .map_err(|_| WsReadError(WebSocketError::InvalidFrameError))?,
+                        continuation: true,
+                        fin,
+                    }))
+                }
+                Some(FrameType::Binary) => {
+                    if fin {
+                        self.last_frame_type = None;
+                    }
+
+                    Ok(Some(Frame::Binary {
+                        payload,
+                        continuation: true,
+                        fin,
+                    }))
+                }
+                _ => Err(WsReadError(WebSocketError::InvalidFrameError)),
+            },
+            0x1 => {
+                if !fin {
+                    self.last_frame_type = Some(FrameType::Text);
+                }
+
+                Ok(Some(Frame::Text {
+                    payload: String::from_utf8(payload)
+                        .map_err(|_| WsReadError(WebSocketError::InvalidFrameError))?,
+                    continuation: false,
+                    fin,
+                }))
+            }
+            0x2 => {
+                if !fin {
+                    self.last_frame_type = Some(FrameType::Binary);
+                }
+
+                Ok(Some(Frame::Binary {
+                    payload,
+                    continuation: false,
+                    fin,
+                }))
+            }
+            // reserved data frames
+            0x3..=0x7 => Err(WsReadError(WebSocketError::InvalidFrameError)),
+            0x8 if payload_length == 0 => Ok(Some(Frame::Close { payload: None })),
+            // if there is a payload it must have a u16 status code
+            0x8 if payload_length < 2 => Err(WsReadError(WebSocketError::InvalidFrameError)),
+            0x8 => {
+                let (status_code, reason) = payload.split_at(2);
+                let status_code = u16::from_be_bytes(
+                    status_code
+                        .try_into()
+                        .map_err(|_e| WsReadError(WebSocketError::InvalidFrameError))?,
+                );
+                Ok(Some(Frame::Close {
+                    payload: Some((
+                        status_code,
+                        String::from_utf8(reason.to_vec())
+                            .map_err(|_e| WsReadError(WebSocketError::InvalidFrameError))?,
+                    )),
+                }))
+            }
+            0x9 if payload_length == 0 => Ok(Some(Frame::Ping { payload: None })),
+            0x9 => Ok(Some(Frame::Ping {
+                payload: Some(payload),
+            })),
+            0xA if payload_length == 0 => Ok(Some(Frame::Pong { payload: None })),
+            0xA => Ok(Some(Frame::Pong {
+                payload: Some(payload),
+            })),
+            // reserved control frames
+            0xB..=0xFF => return Err(WsReadError(WebSocketError::InvalidFrameError)),
+        }
+    }
+}
+
+impl Encoder<Frame> for WsFrameCodec {
+    type Error = WsWriteError;
+
+    fn encode(&mut self, item: Frame, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        let is_control = item.is_control();
+        let opcode = item.opcode();
+        let fin = item.fin();
+
+        let mut payload = match item {
+            // https://tools.ietf.org/html/rfc6455#section-5.6
+            Frame::Text { payload, .. } => payload.into_bytes(),
+            Frame::Binary { payload, .. } => payload,
+            // https://tools.ietf.org/html/rfc6455#section-5.5.1
+            Frame::Close {
+                payload: Some((status_code, reason)),
+            } => {
+                let mut payload = status_code.to_be_bytes().to_vec();
+                payload.append(&mut reason.into_bytes());
+                payload
+            }
+            Frame::Close { payload: None } => Vec::new(),
+            // https://tools.ietf.org/html/rfc6455#section-5.5.2
+            Frame::Ping { payload } => payload.unwrap_or(Vec::new()),
+            // https://tools.ietf.org/html/rfc6455#section-5.5.3
+            Frame::Pong { payload } => payload.unwrap_or(Vec::new()),
+        };
+        // control frame cannot be longer than 125 bytes: https://tools.ietf.org/html/rfc6455#section-5.5
+        if is_control && payload.len() > 125 {
+            return Err(WsWriteError(WebSocketError::ControlFrameTooLargeError));
+        }
+
+        // set payload len: https://tools.ietf.org/html/rfc6455#section-5.2
+        dst.reserve(14 + payload.len());
+
+        dst.extend_from_slice(&[opcode + fin]);
+        let mut payload_len_data = match payload.len() {
+            0..=125 => (payload.len() as u8).to_be_bytes().to_vec(),
+            126..=U16_MAX_MINUS_ONE => {
+                let mut payload_len_data = vec![126];
+                payload_len_data.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+                payload_len_data
+            }
+            U16_MAX..=U64_MAX_MINUS_ONE => {
+                let mut payload_len_data = vec![127];
+                payload_len_data.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+                payload_len_data
+            }
+            _ => return Err(WsWriteError(WebSocketError::PayloadTooLargeError)),
+        };
+        payload_len_data[0] += 0b10000000; // set masking bit: https://tools.ietf.org/html/rfc6455#section-5.3
+        dst.extend_from_slice(&payload_len_data);
+
+        // payload masking: https://tools.ietf.org/html/rfc6455#section-5.3
+        let mut masking_key = vec![0; 4];
+        self.rng.fill_bytes(&mut masking_key);
+        for (i, byte) in payload.iter_mut().enumerate() {
+            *byte = *byte ^ (masking_key[i % 4]);
+        }
+        dst.extend_from_slice(&masking_key);
+
+        dst.extend_from_slice(&payload);
+
+        Ok(())
+    }
+}
 
 // https://tools.ietf.org/html/rfc6455#section-5.2
 /// Data which is sent and received through the WebSocket connection.
@@ -370,89 +626,11 @@ impl Frame {
         }
     }
 
-    pub(super) async fn send(
-        self,
-        write_half: &mut WebSocketWriteHalf,
-    ) -> Result<(), WebSocketError> {
-        // calculate before moving payload out of self
-        let is_control = self.is_control();
-        let opcode = self.opcode();
-        let fin = self.fin();
-
-        let mut payload = match self {
-            // https://tools.ietf.org/html/rfc6455#section-5.6
-            Self::Text { payload, .. } => payload.into_bytes(),
-            Self::Binary { payload, .. } => payload,
-            // https://tools.ietf.org/html/rfc6455#section-5.5.1
-            Self::Close {
-                payload: Some((status_code, reason)),
-            } => {
-                let mut payload = status_code.to_be_bytes().to_vec();
-                payload.append(&mut reason.into_bytes());
-                payload
-            }
-            Self::Close { payload: None } => Vec::new(),
-            // https://tools.ietf.org/html/rfc6455#section-5.5.2
-            Self::Ping { payload } => payload.unwrap_or(Vec::new()),
-            // https://tools.ietf.org/html/rfc6455#section-5.5.3
-            Self::Pong { payload } => payload.unwrap_or(Vec::new()),
-        };
-        // control frame cannot be longer than 125 bytes: https://tools.ietf.org/html/rfc6455#section-5.5
-        if is_control && payload.len() > 125 {
-            return Err(WebSocketError::ControlFrameTooLargeError);
-        }
-
-        // set payload len: https://tools.ietf.org/html/rfc6455#section-5.2
-        let mut raw_frame = Vec::with_capacity(payload.len() + 14);
-        raw_frame.push(opcode + fin);
-        let mut payload_len_data = match payload.len() {
-            0..=125 => (payload.len() as u8).to_be_bytes().to_vec(),
-            126..=U16_MAX_MINUS_ONE => {
-                let mut payload_len_data = vec![126];
-                payload_len_data.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-                payload_len_data
-            }
-            U16_MAX..=U64_MAX_MINUS_ONE => {
-                let mut payload_len_data = vec![127];
-                payload_len_data.extend_from_slice(&(payload.len() as u64).to_be_bytes());
-                payload_len_data
-            }
-            _ => return Err(WebSocketError::PayloadTooLargeError),
-        };
-        payload_len_data[0] += 0b10000000; // set masking bit: https://tools.ietf.org/html/rfc6455#section-5.3
-        raw_frame.append(&mut payload_len_data);
-
-        // payload masking: https://tools.ietf.org/html/rfc6455#section-5.3
-        let mut masking_key = vec![0; 4];
-        write_half.rng.fill_bytes(&mut masking_key);
-        for (i, byte) in payload.iter_mut().enumerate() {
-            *byte = *byte ^ (masking_key[i % 4]);
-        }
-        raw_frame.append(&mut masking_key);
-
-        raw_frame.append(&mut payload);
-
-        write_half
-            .stream
-            .write_all(&raw_frame)
-            .await
-            .map_err(|e| WebSocketError::WriteError(e))?;
-        write_half
-            .stream
-            .flush()
-            .await
-            .map_err(|e| WebSocketError::WriteError(e))?;
-        Ok(())
-    }
-
     fn is_control(&self) -> bool {
         // control frames: https://tools.ietf.org/html/rfc6455#section-5.5
         match self {
-            Self::Text { .. } => false,
-            Self::Binary { .. } => false,
-            Self::Close { .. } => true,
-            Self::Ping { .. } => true,
-            Self::Pong { .. } => true,
+            Self::Text { .. } | Self::Binary { .. } => false,
+            _ => true,
         }
     }
 
@@ -487,110 +665,6 @@ impl Frame {
             Self::Close { .. } => 0b10000000,
             Self::Ping { .. } => 0b10000000,
             Self::Pong { .. } => 0b10000000,
-        }
-    }
-
-    pub(super) async fn read_from_websocket(
-        read_half: &mut WebSocketReadHalf,
-    ) -> Result<Self, WebSocketError> {
-        // https://tools.ietf.org/html/rfc6455#section-5.2
-        let fin_and_opcode = read_half
-            .stream
-            .read_u8()
-            .await
-            .map_err(|e| WebSocketError::ReadError(e))?;
-        let fin: bool = fin_and_opcode & 0b10000000_u8 != 0;
-        let opcode = fin_and_opcode & 0b00001111_u8;
-
-        let mask_and_payload_len_first_byte = read_half
-            .stream
-            .read_u8()
-            .await
-            .map_err(|e| WebSocketError::ReadError(e))?;
-        let masked = mask_and_payload_len_first_byte & 0b10000000_u8 != 0;
-        if masked {
-            // server to client frames should not be masked
-            return Err(WebSocketError::ReceivedMaskedFrameError);
-        }
-        let payload_len_first_byte = mask_and_payload_len_first_byte & 0b01111111_u8;
-        let payload_len = match payload_len_first_byte {
-            0..=125 => payload_len_first_byte as usize,
-            126 => read_half
-                .stream
-                .read_u16()
-                .await
-                .map_err(|e| WebSocketError::ReadError(e))? as usize,
-            127 => read_half
-                .stream
-                .read_u64()
-                .await
-                .map_err(|e| WebSocketError::ReadError(e))? as usize,
-            _ => unreachable!(),
-        };
-
-        let mut payload = vec![0; payload_len];
-        read_half
-            .stream
-            .read_exact(&mut payload)
-            .await
-            .map_err(|e| WebSocketError::ReadError(e))?;
-
-        match opcode {
-            0x0 => match read_half.last_frame_type {
-                FrameType::Text => Ok(Self::Text {
-                    payload: String::from_utf8(payload)
-                        .map_err(|_e| WebSocketError::InvalidFrameError)?,
-                    continuation: true,
-                    fin,
-                }),
-                FrameType::Binary => Ok(Self::Binary {
-                    payload,
-                    continuation: true,
-                    fin,
-                }),
-                FrameType::Control => Err(WebSocketError::InvalidFrameError),
-            },
-            0x1 => Ok(Self::Text {
-                payload: String::from_utf8(payload)
-                    .map_err(|_e| WebSocketError::InvalidFrameError)?,
-                continuation: false,
-                fin,
-            }),
-            0x2 => Ok(Self::Binary {
-                payload,
-                continuation: false,
-                fin,
-            }),
-            // reserved range
-            0x3..=0x7 => Err(WebSocketError::InvalidFrameError),
-            0x8 if payload_len == 0 => Ok(Self::Close { payload: None }),
-            // if there is a payload it must have a u16 status code
-            0x8 if payload_len < 2 => Err(WebSocketError::InvalidFrameError),
-            0x8 => {
-                let (status_code, reason) = payload.split_at(2);
-                let status_code = u16::from_be_bytes(
-                    status_code
-                        .try_into()
-                        .map_err(|_e| WebSocketError::InvalidFrameError)?,
-                );
-                Ok(Self::Close {
-                    payload: Some((
-                        status_code,
-                        String::from_utf8(reason.to_vec())
-                            .map_err(|_e| WebSocketError::InvalidFrameError)?,
-                    )),
-                })
-            }
-            0x9 if payload_len == 0 => Ok(Self::Ping { payload: None }),
-            0x9 => Ok(Self::Ping {
-                payload: Some(payload),
-            }),
-            0xA if payload_len == 0 => Ok(Self::Pong { payload: None }),
-            0xA => Ok(Self::Pong {
-                payload: Some(payload),
-            }),
-            // reserved range
-            0xB..=0xFF => Err(WebSocketError::InvalidFrameError),
         }
     }
 }

@@ -39,6 +39,7 @@
     missing_debug_implementations
 )]
 
+mod batched;
 mod error;
 pub mod secure;
 mod websocket;

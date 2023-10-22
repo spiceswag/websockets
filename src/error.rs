@@ -90,3 +90,23 @@ pub enum WebSocketError {
     #[error("error using channel")]
     ChannelError,
 }
+
+/// A newtype to that implements [`From<std::io::Error>`]
+/// and converts them to `WebSocketError::ReadError`
+///
+/// Useful for implementing the `Decoder` trait from `tokio_util`.
+pub(crate) struct WsReadError(pub WebSocketError);
+
+impl From<std::io::Error> for WsReadError {
+    fn from(value: std::io::Error) -> Self {
+        Self(WebSocketError::ReadError(value))
+    }
+}
+
+pub(crate) struct WsWriteError(pub WebSocketError);
+
+impl From<std::io::Error> for WsWriteError {
+    fn from(value: std::io::Error) -> Self {
+        Self(WebSocketError::WriteError(value))
+    }
+}

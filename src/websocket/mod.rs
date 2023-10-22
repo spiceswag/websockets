@@ -1,6 +1,7 @@
 pub mod builder;
 pub mod frame;
 mod handshake;
+pub mod message;
 mod parsed_addr;
 pub mod split;
 mod stream;
@@ -107,7 +108,7 @@ impl Default for FrameType {
 /// If the read half receives a Ping or Close frame, it needs to send a
 /// Pong or echo the Close frame and close the WebSocket, respectively.
 /// The write half is notified of these events, but it cannot act on them
-/// unless it is flushed. Events can be explicitly [`flush`](WebSocketWriteHalf::flush())ed,
+/// unless it is flushed. Events can be explicitly [`flush`](WebSocketWriteHalf::flush_events())ed,
 /// but sending a frame will also flush events. If frames are not being
 /// sent frequently, consider explicitly flushing events.
 ///
@@ -141,17 +142,6 @@ impl WebSocket {
         let received_frame = self.read_half.receive().await?;
         self.write_half.flush().await?;
         Ok(received_frame)
-    }
-
-    /// Receives a [`Frame`] over the WebSocket connection **without handling incoming frames.**
-    /// For example, receiving a Ping frame will not queue a Pong frame to be sent,
-    /// and receiving a Close frame will not queue a Close frame to be sent nor close
-    /// the connection.
-    ///
-    /// To automatically handle incoming frames, use the [`receive()`](WebSocket::receive())
-    /// method instead.
-    pub async fn receive_without_handling(&mut self) -> Result<Frame, WebSocketError> {
-        self.read_half.receive_without_handling().await
     }
 
     /// Sends an already constructed [`Frame`] over the WebSocket connection.
@@ -189,16 +179,10 @@ impl WebSocket {
         self.write_half.send_ping(payload).await
     }
 
-    /// Sends a Pong frame over the WebSocket connection, constructed
-    /// from passed arguments.
-    pub async fn send_pong(&mut self, payload: Option<Vec<u8>>) -> Result<(), WebSocketError> {
-        self.write_half.send_pong(payload).await
-    }
-
     /// Shuts down the WebSocket connection **without sending a Close frame**.
     /// It is recommended to use the [`close()`](WebSocket::close()) method instead.
-    pub async fn shutdown(&mut self) -> Result<(), WebSocketError> {
-        self.write_half.shutdown().await
+    pub async fn drop(&mut self) -> Result<(), WebSocketError> {
+        self.write_half.drop().await
     }
 
     /// Splits the WebSocket into a read half and a write half, which can be used separately.

@@ -1,10 +1,14 @@
-use flume::{Receiver, Sender};
-use rand_chacha::ChaCha20Rng;
-use tokio::io::{AsyncWriteExt, BufReader, BufWriter, ReadHalf, WriteHalf};
+use std::pin::Pin;
+use std::task::Poll;
 
-use super::frame::Frame;
-use super::stream::Stream;
-use super::FrameType;
+use flume::{Receiver, Sender};
+use futures::{ready, Sink, SinkExt, Stream, StreamExt};
+use tokio::io::{BufReader, ReadHalf, WriteHalf};
+use tokio_util::codec::{FramedRead, FramedWrite};
+
+use super::frame::{Frame, WsFrameCodec};
+use super::message::{Fragmentation, Message};
+use super::stream::Stream as Socket;
 #[allow(unused_imports)] // for intra doc links
 use super::WebSocket;
 use crate::error::WebSocketError;
@@ -20,98 +24,148 @@ pub(super) enum Event {
 /// This half can only receive frames.
 #[derive(Debug)]
 pub struct WebSocketReadHalf {
-    pub(super) stream: BufReader<ReadHalf<Stream>>,
-    pub(super) last_frame_type: FrameType,
+    pub(super) stream: FramedRead<BufReader<ReadHalf<Socket>>, WsFrameCodec>,
     pub(super) sender: Sender<Event>,
+
+    // a message that has not fully been received yet
+    pub(super) partial_message: Option<Message>,
 }
 
 impl WebSocketReadHalf {
-    /// Receives a [`Frame`] over the WebSocket connection.
+    /// Receives a [`Message`] over the WebSocket connection.
     ///
     /// If the received frame is a Ping frame, an event to send a Pong frame will be queued.
     /// If the received frame is a Close frame, an event to send a Close frame
     /// will be queued and the WebSocket will close. However, events are not
     /// acted upon unless flushed (see the documentation on the [`WebSocket`](WebSocket#splitting)
     /// type for more details).
-    pub async fn receive(&mut self) -> Result<Frame, WebSocketError> {
-        let frame = self.receive_without_handling().await?;
-        // handle incoming frames
-        match &frame {
-            // echo ping frame (https://tools.ietf.org/html/rfc6455#section-5.5.2)
-            Frame::Ping { payload } => {
-                let pong = Frame::Pong {
-                    payload: payload.clone(),
-                };
-                self.sender
-                    .send(Event::SendPongFrame(pong))
-                    .map_err(|_e| WebSocketError::ChannelError)?;
-            }
-            // echo close frame and shutdown (https://tools.ietf.org/html/rfc6455#section-1.4)
-            Frame::Close { payload } => {
-                let close = Frame::Close {
-                    payload: payload
-                        .as_ref()
-                        .map(|(status_code, _reason)| (status_code.clone(), String::new())),
-                };
-                self.sender
-                    .send(Event::SendCloseFrameAndShutdown(close))
-                    .map_err(|_e| WebSocketError::ChannelError)?;
-            }
-            _ => (),
+    pub async fn receive(&mut self) -> Result<Message, WebSocketError> {
+        match self.next().await {
+            None => Err(WebSocketError::WebSocketClosedError),
+            Some(res) => res,
         }
-        Ok(frame)
     }
+}
 
-    /// Receives a [`Frame`] over the WebSocket connection **without handling incoming frames.**
-    /// For example, receiving a Ping frame will not queue a Pong frame to be sent,
-    /// and receiving a Close frame will not queue a Close frame to be sent nor close
-    /// the connection.
-    ///
-    /// To automatically handle incoming frames, use the [`receive()`](WebSocketReadHalf::receive())
-    /// method instead.
-    pub async fn receive_without_handling(&mut self) -> Result<Frame, WebSocketError> {
-        let frame = Frame::read_from_websocket(self).await?;
-        // remember last data frame type in case we get continuation frames (https://tools.ietf.org/html/rfc6455#section-5.2)
-        match frame {
-            Frame::Text { .. } => self.last_frame_type = FrameType::Text,
-            Frame::Binary { .. } => self.last_frame_type = FrameType::Binary,
-            _ => (),
+impl Stream for WebSocketReadHalf {
+    type Item = Result<Message, WebSocketError>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        // piece together a frame
+
+        let frame = match ready!(self.stream.poll_next_unpin(cx)) {
+            Some(Ok(f)) => f,
+            Some(Err(err)) => return Poll::Ready(Some(Err(err.0))),
+            None => return Poll::Ready(None),
         };
-        Ok(frame)
+
+        match frame {
+            Frame::Ping { payload } => {
+                self.sender
+                    .send(Event::SendPongFrame(Frame::Pong { payload }))
+                    .map_err(|_| WebSocketError::ChannelError)?;
+                Poll::Pending
+            }
+            Frame::Close { payload } => {
+                self.sender
+                    .send(Event::SendCloseFrameAndShutdown(Frame::Close { payload }))
+                    .map_err(|_| WebSocketError::ChannelError)?;
+                Poll::Ready(None)
+            }
+            Frame::Binary {
+                payload,
+                continuation,
+                fin,
+            } => {
+                let complete = match self.partial_message {
+                    Some(Message::Binary(mut prev_payloads)) if continuation => {
+                        prev_payloads.extend(payload);
+                        prev_payloads
+                    }
+                    None if !continuation => payload,
+                    _ => unreachable!(),
+                };
+
+                if fin {
+                    Poll::Ready(Some(Ok(Message::Binary(complete))))
+                } else {
+                    self.partial_message = Some(Message::Binary(complete));
+                    Poll::Pending
+                }
+            }
+            Frame::Text {
+                payload,
+                continuation,
+                fin,
+            } => {
+                let complete = match self.partial_message {
+                    Some(Message::Text(mut prev_payloads)) if continuation => {
+                        prev_payloads.extend(payload.chars());
+                        prev_payloads
+                    }
+                    None if !continuation => payload,
+                    _ => unreachable!(),
+                };
+
+                if fin {
+                    Poll::Ready(Some(Ok(Message::Text(complete))))
+                } else {
+                    self.partial_message = Some(Message::Text(complete));
+                    Poll::Pending
+                }
+            }
+
+            _ => Poll::Pending,
+        }
     }
 }
 
 /// The write half of a WebSocket connection, generated from [`WebSocket::split()`].
 /// This half can only send frames.
+///
+/// # Sending messages
+///
+/// Sending messages through this structure is as simple as using the [`Sink`] implementation.
+/// The fragmentation strategy in use can be adjusted
+///
 #[derive(Debug)]
 pub struct WebSocketWriteHalf {
-    pub(super) shutdown: bool,
-    pub(super) sent_closed: bool,
-    pub(super) stream: BufWriter<WriteHalf<Stream>>,
-    pub(super) rng: ChaCha20Rng,
+    pub(super) stream: FramedWrite<WriteHalf<Socket>, WsFrameCodec>,
+    pub(super) fragmentation: Fragmentation,
+
     pub(super) receiver: Receiver<Event>,
+    /// A flag that signals that the sink is trying to shut down or already has shut down
+    pub(super) shutdown: bool,
+    /// A flag that is raised when we are the first party to send a close frame
+    pub(super) sent_closed: bool,
 }
 
 impl WebSocketWriteHalf {
     /// Flushes incoming events from the read half. If the read half received a Ping frame,
     /// a Pong frame will be sent. If the read half received a Close frame,
     /// an echoed Close frame will be sent and the WebSocket will close.
+    ///
     /// See the documentation on the [`WebSocket`](WebSocket#splitting) type for more details
     /// about events.
-    pub async fn flush(&mut self) -> Result<(), WebSocketError> {
+    pub async fn flush_events(&mut self) -> Result<(), WebSocketError> {
         while let Ok(event) = self.receiver.try_recv() {
             if self.shutdown {
                 break;
             }
             match event {
-                Event::SendPongFrame(frame) => self.send_without_events_check(frame).await?,
+                Event::SendPongFrame(frame) => {
+                    self.stream.send(frame).await.map_err(|err| err.0)?
+                }
                 Event::SendCloseFrameAndShutdown(frame) => {
                     // read half will always send this event if it has received a close frame,
                     // but if we have sent one already, then we have sent and received a close
                     // frame, so we will shutdown
                     if self.sent_closed {
-                        self.send_without_events_check(frame).await?;
-                        self.shutdown().await?;
+                        self.stream.send(frame).await.map_err(|err| err.0)?;
+                        self.drop().await?;
                     }
                 }
             };
@@ -119,64 +173,13 @@ impl WebSocketWriteHalf {
         Ok(())
     }
 
-    /// Sends an already constructed [`Frame`] over the WebSocket connection.
-    ///
-    /// This method will flush incoming events.
-    /// See the documentation on the [`WebSocket`](WebSocket#splitting) type for more details
-    /// about events.
-    pub async fn send(&mut self, frame: Frame) -> Result<(), WebSocketError> {
-        self.flush().await?;
-        if self.shutdown || self.sent_closed {
-            return Err(WebSocketError::WebSocketClosedError);
-        }
-        self.send_without_events_check(frame).await
-    }
-
-    /// Sends an already constructed [`Frame`] over the WebSocket connection
-    /// without flushing incoming events from the read half.
-    /// See the documentation on the [`WebSocket`](WebSocket#splitting) type for more details
-    /// about events.
-    async fn send_without_events_check(&mut self, frame: Frame) -> Result<(), WebSocketError> {
-        frame.send(self).await?;
-        Ok(())
-    }
-
-    /// Sends a Text frame over the WebSocket connection, constructed
-    /// from passed arguments. `continuation` will be `false` and `fin` will be `true`.
-    /// To use a custom `continuation` or `fin`, construct a [`Frame`] and use
-    /// [`WebSocketWriteHalf::send()`].
-    ///
-    /// This method will flush incoming events.
-    /// See the documentation on the [`WebSocket`](WebSocket#splitting) type for more details
-    /// about events.
-    pub async fn send_text(&mut self, payload: String) -> Result<(), WebSocketError> {
-        // https://tools.ietf.org/html/rfc6455#section-5.6
-        self.send(Frame::text(payload)).await
-    }
-
-    /// Sends a Binary frame over the WebSocket connection, constructed
-    /// from passed arguments. `continuation` will be `false` and `fin` will be `true`.
-    /// To use a custom `continuation` or `fin`, construct a [`Frame`] and use
-    /// [`WebSocketWriteHalf::send()`].
-    ///
-    /// This method will flush incoming events.
-    /// See the documentation on the [`WebSocket`](WebSocket#splitting) type for more details
-    /// about events.
-    pub async fn send_binary(&mut self, payload: Vec<u8>) -> Result<(), WebSocketError> {
-        // https://tools.ietf.org/html/rfc6455#section-5.6
-        self.send(Frame::binary(payload)).await
-    }
-
     /// Shuts down the WebSocket connection **without sending a Close frame**.
     /// It is recommended to use the [`close()`](WebSocketWriteHalf::close()) method instead.
-    pub async fn shutdown(&mut self) -> Result<(), WebSocketError> {
-        self.stream
-            .shutdown()
-            .await
-            .map_err(|e| WebSocketError::ShutdownError(e))?;
-        // indicates that a closed frame has been sent, so no more frames should be sent,
-        // but the underlying stream is not technically closed (closing the stream
-        // would prevent a Close frame from being received by the read half)
+    pub async fn drop(&mut self) -> Result<(), WebSocketError> {
+        SinkExt::close(self).await?;
+
+        self.shutdown = true;
+        // Stops us from sending a second close frame after receiving the close frame that the peer echoed
         self.sent_closed = true;
         Ok(())
     }
@@ -193,7 +196,10 @@ impl WebSocketWriteHalf {
     /// about events.
     pub async fn close(&mut self, payload: Option<(u16, String)>) -> Result<(), WebSocketError> {
         // https://tools.ietf.org/html/rfc6455#section-5.5.1
-        self.send(Frame::Close { payload }).await?;
+        self.stream
+            .send(Frame::Close { payload })
+            .await
+            .map_err(|err| err.0)?;
         // self.shutdown().await?;
         Ok(())
     }
@@ -206,18 +212,87 @@ impl WebSocketWriteHalf {
     /// about events.
     pub async fn send_ping(&mut self, payload: Option<Vec<u8>>) -> Result<(), WebSocketError> {
         // https://tools.ietf.org/html/rfc6455#section-5.5.2
-        self.send(Frame::Ping { payload }).await
+        self.stream
+            .send(Frame::Ping { payload })
+            .await
+            .map_err(|err| err.0)
+    }
+}
+
+impl Sink<Message> for WebSocketWriteHalf {
+    type Error = WebSocketError;
+
+    fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+        if self.shutdown || self.sent_closed {
+            return Err(WebSocketError::WebSocketClosedError);
+        }
+
+        let frames = self.fragmentation.fragment(item);
+
+        todo!()
     }
 
-    /// Sends a Pong frame over the WebSocket connection, constructed
-    /// from passed arguments.
-    ///
-    /// This method will flush incoming events.
-    /// See the documentation on the [`WebSocket`](WebSocket#splitting) type for more details
-    /// about events.
-    pub async fn send_pong(&mut self, payload: Option<Vec<u8>>) -> Result<(), WebSocketError> {
-        // https://tools.ietf.org/html/rfc6455#section-5.5.3
-        self.send(Frame::Pong { payload }).await
+    fn poll_ready(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        if self.shutdown {
+            return self.poll_close_unpin(cx);
+        }
+
+        // try to feed events into the sink
+        while let Ok(event) = self.receiver.try_recv() {
+            // make sure we're ready for feeding
+            match self.stream.poll_ready_unpin(cx).map_err(|err| err.0) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                _ => {}
+            }
+
+            match event {
+                Event::SendPongFrame(frame) => {
+                    self.stream.start_send_unpin(frame).map_err(|err| err.0)?
+                }
+                Event::SendCloseFrameAndShutdown(frame) => {
+                    // read half will always send this event if it has received a close frame,
+                    // but if we have sent one already, then we have sent and received a close
+                    // frame, so we will shutdown
+                    if self.sent_closed {
+                        self.stream.start_send_unpin(frame).map_err(|err| err.0)?;
+
+                        // Not needed because we're already trying to close the sink when the shutdown flag is up
+                        // self.drop().await?;
+                    }
+                }
+            };
+        }
+
+        // The fact that we poll twice before a send
+        // introduces a sort of dos attack where the server spams
+        // pings and we can't send any actual data in return.
+        self.stream.poll_ready_unpin(cx).map_err(|err| err.0)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        self.stream.poll_flush_unpin(cx).map_err(|err| err.0)
+    }
+
+    fn poll_close(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        // this is not that undesired considering you can just call WebSocketWriteHalf::drop
+        self.stream
+            .poll_close_unpin(cx)
+            .map_err(|err| err.0)
+            .map_err(|err| match err {
+                // From<std::io::Error> (used by Framed) yields this type of error so we have to transform it to shutdown error
+                WebSocketError::WriteError(err) => WebSocketError::ShutdownError(err),
+                _ => err,
+            })
     }
 }
 

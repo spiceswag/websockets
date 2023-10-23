@@ -2,6 +2,7 @@ pub mod builder;
 pub mod frame;
 mod handshake;
 pub mod message;
+pub mod ops;
 mod parsed_addr;
 pub mod split;
 mod stream;
@@ -170,7 +171,7 @@ impl WebSocket {
     /// from passed arguments, and closes the WebSocket connection.
     /// This method will attempt to wait for an echoed Close frame,
     /// which is returned.
-    pub async fn close(&mut self, payload: Option<(u16, String)>) -> Result<(), WebSocketError> {
+    pub async fn close(mut self, payload: Option<(u16, String)>) -> Result<(), WebSocketError> {
         self.inner.write.close(payload).await
     }
 
@@ -182,7 +183,7 @@ impl WebSocket {
 
     /// Shuts down the WebSocket connection **without sending a Close frame**.
     /// It is recommended to use the [`close()`](WebSocket::close()) method instead.
-    pub async fn drop(&mut self) -> Result<(), WebSocketError> {
+    pub async fn drop(mut self) -> Result<(), WebSocketError> {
         self.inner.write.drop().await
     }
 

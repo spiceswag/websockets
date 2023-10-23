@@ -6,8 +6,12 @@ use sha1::{Digest, Sha1};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, WriteHalf};
 use tokio_util::codec::FramedWrite;
 
-use super::{frame::WsFrameCodec, parsed_addr::ParsedAddr, stream::Stream};
-use crate::{batched::Batched, error::WebSocketError, Frame, WebSocket};
+use super::{
+    frame::{Frame, WsFrameCodec},
+    parsed_addr::ParsedAddr,
+    stream::Stream,
+};
+use crate::{batched::Batched, error::WebSocketError, WebSocket};
 
 const GUUID: &'static str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 

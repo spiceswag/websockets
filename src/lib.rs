@@ -45,7 +45,8 @@ pub mod secure;
 mod websocket;
 
 pub use error::WebSocketError;
-pub use websocket::frame::Frame;
+pub use websocket::message::Message;
+pub use websocket::ops;
 pub use websocket::split::{WebSocketReadHalf, WebSocketWriteHalf};
 pub use websocket::{builder::WebSocketBuilder, WebSocket};
 
@@ -60,8 +61,7 @@ mod tests {
             .unwrap();
         let message = "a".repeat(3).to_string();
         ws.send_text(message.clone()).await.unwrap();
-        let received_frame = ws.receive().await.unwrap();
-        let received_message = received_frame.as_text().unwrap().0.clone();
+        let received_message = ws.receive().await.unwrap().as_text().unwrap();
         assert_eq!(message, received_message);
     }
 
@@ -72,8 +72,7 @@ mod tests {
             .unwrap();
         let message = "a".repeat(300).to_string();
         ws.send_text(message.clone()).await.unwrap();
-        let received_frame = ws.receive().await.unwrap();
-        let received_message = received_frame.as_text().unwrap().0.clone();
+        let received_message = ws.receive().await.unwrap().as_text().unwrap();
         assert_eq!(message, received_message);
     }
 
@@ -84,8 +83,7 @@ mod tests {
             .unwrap();
         let message = "a".repeat(66000).to_string();
         ws.send_text(message.clone()).await.unwrap();
-        let received_frame = ws.receive().await.unwrap();
-        let received_message = received_frame.as_text().unwrap().0.clone();
+        let received_message = ws.receive().await.unwrap().as_text().unwrap();
         assert_eq!(message, received_message);
     }
 
@@ -96,8 +94,7 @@ mod tests {
             .unwrap();
         let message = "a".repeat(66000).to_string();
         ws.send_text(message.clone()).await.unwrap();
-        let received_frame = ws.receive().await.unwrap();
-        let received_message = received_frame.as_text().unwrap().0.clone();
+        let received_message = ws.receive().await.unwrap().as_text().unwrap();
         assert_eq!(message, received_message);
     }
 

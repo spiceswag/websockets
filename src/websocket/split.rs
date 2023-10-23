@@ -7,7 +7,7 @@ use tokio::io::{BufReader, ReadHalf, WriteHalf};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use super::frame::{Frame, WsFrameCodec};
-use super::message::{Fragmentation, Message};
+use super::message::{Fragmentation, Message, MessageFragment};
 use super::stream::Stream as Socket;
 #[allow(unused_imports)] // for intra doc links
 use super::WebSocket;
@@ -124,6 +124,45 @@ impl Stream for WebSocketReadHalf {
     }
 }
 
+impl WebSocketReadHalf {
+    /// Receive the next message fragmented as it comes in.
+    ///
+    /// Useful for large messages where it is more optimal to process it as it
+    /// comes in, rather than all at once.
+    pub fn receive_fragmented<'a>(&'a mut self) -> FragmentedMessage<'a> {
+        todo!()
+    }
+}
+
+/// A [`Stream`] yielding the next message fragmented,
+/// as it is received from the remote peer.
+///
+/// Useful for large messages where it is more optimal to process it as it
+/// comes in, rather than all at once.
+///
+/// # Receiving
+///
+/// This type implements [Stream<Item = Result<Message, WebSocketError>], but returned "`Messages`"
+/// are not actual messages but parts of a single fragmented message.
+///
+/// Be mindful of the fact that the current implementation does not
+/// account for the in-spec edge case where a UTF-8 sequence is split over 2 frames.
+#[derive(Debug)]
+pub struct FragmentedMessage<'a> {
+    read: &'a mut WebSocketReadHalf,
+}
+
+impl<'a> Stream for FragmentedMessage<'a> {
+    type Item = Result<MessageFragment, WebSocketError>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        todo!()
+    }
+}
+
 /// The write half of a WebSocket connection, generated from [`WebSocket::split()`].
 /// This half can only send frames.
 ///
@@ -137,6 +176,7 @@ pub struct WebSocketWriteHalf {
     pub(super) stream: Batched<FramedWrite<WriteHalf<Socket>, WsFrameCodec>, Frame>,
     pub(super) fragmentation: Fragmentation,
 
+    /// Event receiver
     pub(super) receiver: Receiver<Event>,
     /// A flag that signals that the sink is trying to shut down or already has shut down
     pub(super) shutdown: bool,

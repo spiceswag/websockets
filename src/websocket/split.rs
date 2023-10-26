@@ -141,7 +141,7 @@ impl WebSocketReadHalf {
             read: self,
             data_type: None,
             staggered_utf8: None,
-            first: false,
+            first_arrived: false,
             fin: false,
         }
     }
@@ -165,7 +165,7 @@ pub struct FragmentedMessage<'a> {
 
     /// If the first frame of the message has been received.
     /// Useful for checking for invalid frames.
-    first: bool,
+    first_arrived: bool,
     /// If the message is finished.
     fin: bool,
 }
@@ -191,7 +191,7 @@ impl<'a> Stream for FragmentedMessage<'a> {
             self.data_type = Some(frame.frame_type())
         }
 
-        self.first = true;
+        self.first_arrived = true;
 
         match frame {
             Frame::Ping { payload } => {
@@ -213,7 +213,7 @@ impl<'a> Stream for FragmentedMessage<'a> {
                 continuation,
                 fin,
             } => {
-                if !continuation && !self.first {
+                if !continuation && !self.first_arrived {
                     return Poll::Ready(Some(Err(WebSocketError::InvalidFrameError)));
                 }
 
@@ -225,7 +225,7 @@ impl<'a> Stream for FragmentedMessage<'a> {
                 continuation,
                 fin,
             } => {
-                if !continuation && !self.first {
+                if !continuation && !self.first_arrived {
                     return Poll::Ready(Some(Err(WebSocketError::InvalidFrameError)));
                 }
 

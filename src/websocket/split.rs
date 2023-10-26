@@ -1,14 +1,17 @@
+use std::io::Cursor;
 use std::pin::Pin;
 use std::task::Poll;
 
 use flume::{Receiver, Sender};
+use futures::stream::FusedStream;
 use futures::{ready, Sink, SinkExt, Stream, StreamExt};
 use tokio::io::{BufReader, ReadHalf, WriteHalf};
 use tokio_util::codec::{FramedRead, FramedWrite};
 
+use super::frame::FrameType;
 use super::frame::{Frame, WsFrameCodec};
-use super::message::{Fragmentation, Message, MessageFragment};
-use super::stream::Stream as Socket;
+use super::message::{Fragmentation, IncompleteMessage, Message, MessageFragment};
+use super::socket::Socket;
 #[allow(unused_imports)] // for intra doc links
 use super::WebSocket;
 use crate::batched::{Batched, Prioritized};
@@ -29,7 +32,7 @@ pub struct WebSocketReadHalf {
     pub(super) sender: Sender<Event>,
 
     // a message that has not fully been received yet
-    pub(super) partial_message: Option<Message>,
+    pub(super) partial_message: Option<IncompleteMessage>,
 }
 
 impl WebSocketReadHalf {
@@ -82,10 +85,11 @@ impl Stream for WebSocketReadHalf {
                 fin,
             } => {
                 let complete = match self.partial_message.take() {
-                    Some(Message::Binary(mut prev_payloads)) if continuation => {
-                        prev_payloads.extend(payload);
+                    Some(IncompleteMessage::Binary(mut prev_payloads)) if continuation => {
+                        prev_payloads.extend(payload.iter());
                         prev_payloads
                     }
+                    // into_owned() is ok because received frames are 'static
                     None if !continuation => payload,
                     _ => unreachable!(),
                 };
@@ -93,7 +97,7 @@ impl Stream for WebSocketReadHalf {
                 if fin {
                     Poll::Ready(Some(Ok(Message::Binary(complete))))
                 } else {
-                    self.partial_message = Some(Message::Binary(complete));
+                    self.partial_message = Some(IncompleteMessage::Binary(complete));
                     Poll::Pending
                 }
             }
@@ -103,8 +107,8 @@ impl Stream for WebSocketReadHalf {
                 fin,
             } => {
                 let complete = match self.partial_message.take() {
-                    Some(Message::Text(mut prev_payloads)) if continuation => {
-                        prev_payloads.extend(payload.chars());
+                    Some(IncompleteMessage::Text(mut prev_payloads)) if continuation => {
+                        prev_payloads.extend(payload);
                         prev_payloads
                     }
                     None if !continuation => payload,
@@ -112,9 +116,12 @@ impl Stream for WebSocketReadHalf {
                 };
 
                 if fin {
-                    Poll::Ready(Some(Ok(Message::Text(complete))))
+                    Poll::Ready(Some(Ok(Message::Text(
+                        String::from_utf8(complete)
+                            .map_err(|_| WebSocketError::InvalidFrameError)?,
+                    ))))
                 } else {
-                    self.partial_message = Some(Message::Text(complete));
+                    self.partial_message = Some(IncompleteMessage::Text(complete));
                     Poll::Pending
                 }
             }
@@ -130,7 +137,13 @@ impl WebSocketReadHalf {
     /// Useful for large messages where it is more optimal to process it as it
     /// comes in, rather than all at once.
     pub fn receive_fragmented<'a>(&'a mut self) -> FragmentedMessage<'a> {
-        todo!()
+        FragmentedMessage {
+            read: self,
+            data_type: None,
+            staggered_utf8: None,
+            first: false,
+            fin: false,
+        }
     }
 }
 
@@ -139,27 +152,107 @@ impl WebSocketReadHalf {
 ///
 /// Useful for large messages where it is more optimal to process it as it
 /// comes in, rather than all at once.
-///
-/// # Receiving
-///
-/// This type implements [Stream<Item = Result<Message, WebSocketError>], but returned "`Messages`"
-/// are not actual messages but parts of a single fragmented message.
-///
-/// Be mindful of the fact that the current implementation does not
-/// account for the in-spec edge case where a UTF-8 sequence is split over 2 frames.
 #[derive(Debug)]
 pub struct FragmentedMessage<'a> {
+    /// The handle to the web socket read half
     read: &'a mut WebSocketReadHalf,
+
+    /// The expected frame type.
+    data_type: Option<FrameType>,
+
+    /// Any UTF-8 bytes staggered as outlined in the documentation of [`MessageFragment::Text`]
+    staggered_utf8: Option<Vec<u8>>,
+
+    /// If the first frame of the message has been received.
+    /// Useful for checking for invalid frames.
+    first: bool,
+    /// If the message is finished.
+    fin: bool,
 }
 
 impl<'a> Stream for FragmentedMessage<'a> {
     type Item = Result<MessageFragment, WebSocketError>;
 
     fn poll_next(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        todo!()
+        if self.fin {
+            return Poll::Ready(None);
+        }
+
+        let frame = match ready!(self.read.stream.poll_next_unpin(cx)) {
+            Some(Ok(f)) => f,
+            Some(Err(err)) => return Poll::Ready(Some(Err(err.0))),
+            None => return Poll::Ready(None),
+        };
+
+        if self.data_type.is_none() {
+            self.data_type = Some(frame.frame_type())
+        }
+
+        self.first = true;
+
+        match frame {
+            Frame::Ping { payload } => {
+                self.read
+                    .sender
+                    .send(Event::SendPongFrame(Frame::Pong { payload }))
+                    .map_err(|_| WebSocketError::ChannelError)?;
+                Poll::Pending
+            }
+            Frame::Close { payload } => {
+                self.read
+                    .sender
+                    .send(Event::SendCloseFrameAndShutdown(Frame::Close { payload }))
+                    .map_err(|_| WebSocketError::ChannelError)?;
+                Poll::Ready(None)
+            }
+            Frame::Binary {
+                payload,
+                continuation,
+                fin,
+            } => {
+                if !continuation && !self.first {
+                    return Poll::Ready(Some(Err(WebSocketError::InvalidFrameError)));
+                }
+
+                self.fin = fin;
+                Poll::Ready(Some(Ok(MessageFragment::Binary(payload))))
+            }
+            Frame::Text {
+                mut payload,
+                continuation,
+                fin,
+            } => {
+                if !continuation && !self.first {
+                    return Poll::Ready(Some(Err(WebSocketError::InvalidFrameError)));
+                }
+
+                let prev_partial_utf8 = self.staggered_utf8.take();
+
+                let current_partial_utf8 = split_off_partial_utf8(&mut payload);
+
+                if let Some(prepend) = prev_partial_utf8 {
+                    payload.splice(0..0, prepend.into_iter());
+                }
+
+                self.staggered_utf8 = Some(current_partial_utf8);
+                self.fin = fin;
+
+                Poll::Ready(Some(Ok(MessageFragment::Text(
+                    String::from_utf8(payload).map_err(|_| WebSocketError::InvalidFrameError)?,
+                ))))
+            }
+
+            _ => Poll::Pending,
+        }
+    }
+}
+
+impl<'a> FusedStream for FragmentedMessage<'a> {
+    fn is_terminated(&self) -> bool {
+        self.fin
     }
 }
 
@@ -370,4 +463,9 @@ mod tests {
         WebSocketWriteHalf: Send + Sync,
     {
     }
+}
+
+/// Splits off any partial utf8 characters from a string (!) buffer.
+fn split_off_partial_utf8(vec: &mut Vec<u8>) -> Vec<u8> {
+    todo!()
 }

@@ -4,8 +4,8 @@ mod handshake;
 pub mod message;
 pub mod ops;
 mod parsed_addr;
+mod socket;
 pub mod split;
-mod stream;
 
 use std::task::{ready, Poll};
 
@@ -14,20 +14,7 @@ use builder::WebSocketBuilder;
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use split::{WebSocketReadHalf, WebSocketWriteHalf};
 
-use self::message::Message;
-
-#[derive(Debug)]
-enum FrameType {
-    Text,
-    Binary,
-    Control,
-}
-
-impl Default for FrameType {
-    fn default() -> Self {
-        Self::Control
-    }
-}
+use self::{message::Message, ops::Pong};
 
 /// Manages the WebSocket connection; used to connect, send data, and receive data.
 ///
@@ -42,7 +29,7 @@ impl Default for FrameType {
 /// # }
 /// ```
 ///
-/// Cuustomize the handshake using a [`WebSocketBuilder`] obtained from [`WebSocket::builder()`]:
+/// Customize the handshake using a [`WebSocketBuilder`] obtained from [`WebSocket::builder()`]:
 ///
 /// ```
 /// # use websockets::{WebSocket, WebSocketError};
@@ -177,7 +164,7 @@ impl WebSocket {
 
     /// Sends a Ping frame over the WebSocket connection, constructed
     /// from passed arguments.
-    pub async fn send_ping(&mut self, payload: Option<Vec<u8>>) -> Result<(), WebSocketError> {
+    pub fn send_ping(&mut self, payload: Option<Vec<u8>>) -> Pong {
         todo!()
     }
 

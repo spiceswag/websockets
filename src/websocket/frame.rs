@@ -5,7 +5,6 @@ use rand_chacha::ChaCha20Rng;
 use tokio_util::bytes::BytesMut;
 use tokio_util::codec::{Decoder, Encoder};
 
-use super::FrameType;
 #[allow(unused_imports)] // for intra doc links
 use super::WebSocket;
 use crate::error::{WebSocketError, WsReadError, WsWriteError};
@@ -127,8 +126,7 @@ impl Decoder for WsFrameCodec {
                     }
 
                     Ok(Some(Frame::Text {
-                        payload: String::from_utf8(payload)
-                            .map_err(|_| WsReadError(WebSocketError::InvalidFrameError))?,
+                        payload,
                         continuation: true,
                         fin,
                     }))
@@ -152,8 +150,7 @@ impl Decoder for WsFrameCodec {
                 }
 
                 Ok(Some(Frame::Text {
-                    payload: String::from_utf8(payload)
-                        .map_err(|_| WsReadError(WebSocketError::InvalidFrameError))?,
+                    payload,
                     continuation: false,
                     fin,
                 }))
@@ -213,7 +210,7 @@ impl Encoder<Frame> for WsFrameCodec {
 
         let mut payload = match item {
             // https://tools.ietf.org/html/rfc6455#section-5.6
-            Frame::Text { payload, .. } => payload.into_bytes(),
+            Frame::Text { payload, .. } => payload,
             Frame::Binary { payload, .. } => payload,
             // https://tools.ietf.org/html/rfc6455#section-5.5.1
             Frame::Close {
@@ -300,7 +297,7 @@ pub enum Frame {
     /// A Text frame
     Text {
         /// The payload for the Text frame
-        payload: String,
+        payload: Vec<u8>,
         /// Whether the Text frame is a continuation frame in the message
         continuation: bool,
         /// Whether the Text frame is the final frame in the message
@@ -338,7 +335,7 @@ impl Frame {
     /// This can be modified by chaining [`Frame::set_continuation()`] or [`Frame::set_fin()`].
     pub fn text(payload: String) -> Self {
         Self::Text {
-            payload,
+            payload: payload.into_bytes(),
             continuation: false,
             fin: true,
         }
@@ -352,7 +349,7 @@ impl Frame {
     /// Attempts to interpret the frame as a Text frame,
     /// returning a reference to the underlying data if it is,
     /// and None otherwise.
-    pub fn as_text(&self) -> Option<(&String, &bool, &bool)> {
+    pub fn as_text(&self) -> Option<(&[u8], &bool, &bool)> {
         match self {
             Self::Text {
                 payload,
@@ -365,7 +362,7 @@ impl Frame {
     /// Attempts to interpret the frame as a Text frame,
     /// returning a mutable reference to the underlying data if it is,
     /// and None otherwise.
-    pub fn as_text_mut(&mut self) -> Option<(&mut String, &mut bool, &mut bool)> {
+    pub fn as_text_mut(&mut self) -> Option<(&mut Vec<u8>, &mut bool, &mut bool)> {
         match self {
             Self::Text {
                 payload,
@@ -379,7 +376,7 @@ impl Frame {
     /// Attempts to interpret the frame as a Text frame,
     /// consuming and returning the underlying data if it is,
     /// and returning None otherwise.
-    pub fn into_text(self) -> Option<(String, bool, bool)> {
+    pub fn into_text(self) -> Option<(Vec<u8>, bool, bool)> {
         match self {
             Self::Text {
                 payload,
@@ -653,16 +650,25 @@ impl Frame {
             Self::Pong { .. } => 0b10000000,
         }
     }
-}
 
-impl From<String> for Frame {
-    fn from(s: String) -> Self {
-        Self::text(s)
+    pub fn frame_type(&self) -> FrameType {
+        match self {
+            Self::Text { .. } => FrameType::Text,
+            Self::Binary { .. } => FrameType::Binary,
+            _ => FrameType::Control,
+        }
     }
 }
 
-impl From<Vec<u8>> for Frame {
-    fn from(v: Vec<u8>) -> Self {
-        Self::binary(v)
+#[derive(Debug, PartialEq, Eq)]
+pub enum FrameType {
+    Text,
+    Binary,
+    Control,
+}
+
+impl Default for FrameType {
+    fn default() -> Self {
+        Self::Control
     }
 }

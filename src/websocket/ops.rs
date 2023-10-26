@@ -1,4 +1,4 @@
-//! Operations on websockets with custom future implementations.
+//! Operations on web sockets with custom future implementations.
 //! This includes closing the websocket, and pinging the peer.
 
 use futures::FutureExt;
@@ -9,7 +9,7 @@ use std::{
 };
 use tokio::sync::oneshot;
 
-/// A named that resolves as soon as a
+/// A futures that resolves as soon as a
 /// pong message is received from the server.
 ///
 /// Each pong future maps one-to-one with a ping frame sent

@@ -9,7 +9,7 @@ use tokio_util::codec::FramedWrite;
 use super::{
     frame::{Frame, WsFrameCodec},
     parsed_addr::ParsedAddr,
-    stream::Stream,
+    socket::Socket,
 };
 use crate::{batched::Batched, error::WebSocketError, WebSocket};
 
@@ -84,7 +84,7 @@ impl Handshake {
             .await
             .map_err(|e| WebSocketError::WriteError(e))?;
         // flushing on the framed write is equivalent with flushing the raw stream
-        <Batched<FramedWrite<WriteHalf<Stream>, WsFrameCodec>, Frame> as SinkExt<Frame>>::flush(
+        <Batched<FramedWrite<WriteHalf<Socket>, WsFrameCodec>, Frame> as SinkExt<Frame>>::flush(
             &mut ws.inner.write.stream,
         )
         .await

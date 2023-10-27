@@ -164,8 +164,14 @@ impl WebSocket {
 
     /// Sends a Ping frame over the WebSocket connection, constructed
     /// from passed arguments.
-    pub fn send_ping(&mut self, payload: Option<Vec<u8>>) -> Pong {
-        todo!()
+    ///
+    /// This `async` method returns a result containing another future.
+    /// By polling the first future you send the ping packet to the peer.
+    /// By polling the nested future you wait for the peer to respond with a pong frame.
+    ///
+    /// The pong future will not resolve if no frames are being read from the read half of the web socket.
+    pub async fn send_ping(&mut self, payload: Option<Vec<u8>>) -> Result<Pong, WebSocketError> {
+        self.inner.write.send_ping(payload).await
     }
 
     /// Shuts down the WebSocket connection **without sending a Close frame**.

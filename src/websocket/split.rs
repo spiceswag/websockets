@@ -1,4 +1,3 @@
-use std::io::Cursor;
 use std::pin::Pin;
 use std::task::Poll;
 
@@ -6,6 +5,7 @@ use flume::{Receiver, Sender};
 use futures::stream::FusedStream;
 use futures::{ready, Sink, SinkExt, Stream, StreamExt};
 use tokio::io::{BufReader, ReadHalf, WriteHalf};
+use tokio::sync::oneshot;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use super::frame::FrameType;
@@ -16,13 +16,7 @@ use super::socket::Socket;
 use super::WebSocket;
 use crate::batched::{Batched, Prioritized};
 use crate::error::{WebSocketError, WsWriteError};
-
-/// Events sent from the read half to the write half
-#[derive(Debug)]
-pub(super) enum Event {
-    SendPongFrame(Frame),
-    SendCloseFrameAndShutdown(Frame),
-}
+use crate::ops::Pong;
 
 /// The read half of a WebSocket connection, generated from [`WebSocket::split()`].
 /// This half can only receive frames.
@@ -31,8 +25,15 @@ pub struct WebSocketReadHalf {
     pub(super) stream: FramedRead<BufReader<ReadHalf<Socket>>, WsFrameCodec>,
     pub(super) sender: Sender<Event>,
 
-    // a message that has not fully been received yet
+    /// Part of a message that has not fully been received yet.
+    ///
+    /// Should always be `None` when not waiting for frames.
     pub(super) partial_message: Option<IncompleteMessage>,
+
+    ///
+    pub(super) pong_receiver: Receiver<oneshot::Sender<Option<Vec<u8>>>>,
+    /// A list of handles for waking up pong futures.
+    pub(super) pongs: Vec<oneshot::Sender<Option<Vec<u8>>>>,
 }
 
 impl WebSocketReadHalf {
@@ -48,6 +49,20 @@ impl WebSocketReadHalf {
             None => Err(WebSocketError::WebSocketClosedError),
             Some(res) => res,
         }
+    }
+
+    /// Collect pongs sent by the send half of the socket.
+    fn collect_pongs(&mut self) {
+        while let Ok(handle) = self.pong_receiver.try_recv() {
+            self.pongs.push(handle);
+        }
+    }
+
+    /// Wake up pong futures by their handles
+    fn wake_up_pongs(&mut self, payload: Option<Vec<u8>>) {
+        self.pongs.drain(..).for_each(|sender| {
+            let _ = sender.send(payload.clone());
+        });
     }
 }
 
@@ -66,19 +81,28 @@ impl Stream for WebSocketReadHalf {
             None => return Poll::Ready(None),
         };
 
+        self.collect_pongs();
+
         match frame {
             Frame::Ping { payload } => {
                 self.sender
                     .send(Event::SendPongFrame(Frame::Pong { payload }))
                     .map_err(|_| WebSocketError::ChannelError)?;
+
                 Poll::Pending
             }
+            Frame::Pong { payload } => {
+                self.wake_up_pongs(payload);
+                Poll::Pending
+            }
+
             Frame::Close { payload } => {
                 self.sender
                     .send(Event::SendCloseFrameAndShutdown(Frame::Close { payload }))
                     .map_err(|_| WebSocketError::ChannelError)?;
                 Poll::Ready(None)
             }
+
             Frame::Binary {
                 payload,
                 continuation,
@@ -125,8 +149,6 @@ impl Stream for WebSocketReadHalf {
                     Poll::Pending
                 }
             }
-
-            _ => Poll::Pending,
         }
     }
 }
@@ -191,6 +213,10 @@ impl<'a> Stream for FragmentedMessage<'a> {
             self.data_type = Some(frame.frame_type())
         }
 
+        if &frame.frame_type() != self.data_type.as_ref().unwrap() {
+            return Poll::Ready(Some(Err(WebSocketError::InvalidFrameError)));
+        }
+
         self.first_arrived = true;
 
         match frame {
@@ -201,6 +227,11 @@ impl<'a> Stream for FragmentedMessage<'a> {
                     .map_err(|_| WebSocketError::ChannelError)?;
                 Poll::Pending
             }
+            Frame::Pong { payload } => {
+                self.read.wake_up_pongs(payload);
+                Poll::Pending
+            }
+
             Frame::Close { payload } => {
                 self.read
                     .sender
@@ -208,6 +239,7 @@ impl<'a> Stream for FragmentedMessage<'a> {
                     .map_err(|_| WebSocketError::ChannelError)?;
                 Poll::Ready(None)
             }
+
             Frame::Binary {
                 payload,
                 continuation,
@@ -244,8 +276,6 @@ impl<'a> Stream for FragmentedMessage<'a> {
                     String::from_utf8(payload).map_err(|_| WebSocketError::InvalidFrameError)?,
                 ))))
             }
-
-            _ => Poll::Pending,
         }
     }
 }
@@ -253,6 +283,12 @@ impl<'a> Stream for FragmentedMessage<'a> {
 impl<'a> FusedStream for FragmentedMessage<'a> {
     fn is_terminated(&self) -> bool {
         self.fin
+    }
+}
+
+impl<'a> Drop for FragmentedMessage<'a> {
+    fn drop(&mut self) {
+        todo!()
     }
 }
 
@@ -275,6 +311,9 @@ pub struct WebSocketWriteHalf {
     pub(super) shutdown: bool,
     /// A flag that is raised when we are the first party to send a close frame
     pub(super) sent_closed: bool,
+
+    /// Send pong wake up handles
+    pub(super) pong_sender: Sender<oneshot::Sender<Option<Vec<u8>>>>,
 }
 
 impl WebSocketWriteHalf {
@@ -341,15 +380,28 @@ impl WebSocketWriteHalf {
     /// Sends a Ping frame over the WebSocket connection, constructed
     /// from passed arguments.
     ///
+    /// This `async` method returns a result containing another future.
+    /// By polling the first future you send the ping packet to the peer.
+    /// By polling the nested future you wait for the peer to respond with a pong frame.
+    ///
+    /// The pong future will not resolve if no frames are being read from the read half of the web socket.
+    ///
     /// This method will flush incoming events.
     /// See the documentation on the [`WebSocket`](WebSocket#splitting) type for more details
     /// about events.
-    pub async fn send_ping(&mut self, payload: Option<Vec<u8>>) -> Result<(), WebSocketError> {
+    pub async fn send_ping(&mut self, payload: Option<Vec<u8>>) -> Result<Pong, WebSocketError> {
         // https://tools.ietf.org/html/rfc6455#section-5.5.2
+
+        let (send, recv) = oneshot::channel();
+
         self.stream
             .send(Frame::Ping { payload })
             .await
-            .map_err(|err| err.0)
+            .map_err(|err| err.0)?;
+
+        let _ = self.pong_sender.send(send);
+
+        Ok(Pong { recv })
     }
 }
 
@@ -463,6 +515,13 @@ mod tests {
         WebSocketWriteHalf: Send + Sync,
     {
     }
+}
+
+/// Events sent from the read half to the write half
+#[derive(Debug)]
+pub(super) enum Event {
+    SendPongFrame(Frame),
+    SendCloseFrameAndShutdown(Frame),
 }
 
 /// Splits off any partial utf8 characters from a string (!) buffer.

@@ -29,7 +29,7 @@ use tokio::sync::oneshot;
 /// https://datatracker.ietf.org/doc/html/rfc6455#section-5.5.3
 #[derive(Debug)]
 pub struct Pong {
-    recv: oneshot::Receiver<Option<Vec<u8>>>,
+    pub(super) recv: oneshot::Receiver<Option<Vec<u8>>>,
 }
 
 impl Future for Pong {

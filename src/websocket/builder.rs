@@ -83,21 +83,26 @@ impl WebSocketBuilder {
             _ => return Err(WebSocketError::SchemeError),
         };
 
+        let (event_sender, event_receiver) = flume::unbounded();
+        let (pong_handle_sender, pong_handle_receiver) = flume::unbounded();
+
         let (read_half, write_half) = io::split(stream);
-        let (sender, receiver) = flume::unbounded();
         let mut ws = WebSocket {
             inner: FlushingWs {
                 read: WebSocketReadHalf {
                     stream: FramedRead::new(BufReader::new(read_half), WsFrameCodec::new()),
-                    sender,
+                    sender: event_sender,
                     partial_message: None,
+                    pong_receiver: pong_handle_receiver,
+                    pongs: vec![],
                 },
                 write: WebSocketWriteHalf {
                     stream: Batched::new(FramedWrite::new(write_half, WsFrameCodec::new()), 16),
                     fragmentation: self.fragmentation,
-                    receiver,
+                    receiver: event_receiver,
                     shutdown: false,
                     sent_closed: false,
+                    pong_sender: pong_handle_sender,
                 },
                 received_message: None,
             },

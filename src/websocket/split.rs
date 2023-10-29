@@ -15,7 +15,7 @@ use super::socket::Socket;
 #[allow(unused_imports)] // for intra doc links
 use super::WebSocket;
 use crate::batched::{Batched, Prioritized};
-use crate::error::{WebSocketError, WsWriteError};
+use crate::error::{InvalidFrameReason, WebSocketError, WsWriteError};
 use crate::ops::Pong;
 
 /// The read half of a WebSocket connection, generated from [`WebSocket::split()`].
@@ -141,8 +141,9 @@ impl Stream for WebSocketReadHalf {
 
                 if fin {
                     Poll::Ready(Some(Ok(Message::Text(
-                        String::from_utf8(complete)
-                            .map_err(|_| WebSocketError::InvalidFrameError)?,
+                        String::from_utf8(complete).map_err(|_| {
+                            WebSocketError::InvalidFrame(crate::error::InvalidFrameReason::BadUtf8)
+                        })?,
                     ))))
                 } else {
                     self.partial_message = Some(IncompleteMessage::Text(complete));
@@ -213,9 +214,7 @@ impl<'a> Stream for FragmentedMessage<'a> {
             self.data_type = Some(frame.frame_type())
         }
 
-        if &frame.frame_type() != self.data_type.as_ref().unwrap() {
-            return Poll::Ready(Some(Err(WebSocketError::InvalidFrameError)));
-        }
+        // No need to check for frame type equivalence because its derived in the frame layer
 
         self.first_arrived = true;
 
@@ -240,40 +239,39 @@ impl<'a> Stream for FragmentedMessage<'a> {
                 Poll::Ready(None)
             }
 
-            Frame::Binary {
-                payload,
-                continuation,
-                fin,
-            } => {
-                if !continuation && !self.first_arrived {
-                    return Poll::Ready(Some(Err(WebSocketError::InvalidFrameError)));
-                }
+            Frame::Binary { payload, fin, .. } => {
+                // no need to check for bad continuation flags because its caught by the framing layer
 
                 self.fin = fin;
                 Poll::Ready(Some(Ok(MessageFragment::Binary(payload))))
             }
             Frame::Text {
-                mut payload,
-                continuation,
-                fin,
+                mut payload, fin, ..
             } => {
-                if !continuation && !self.first_arrived {
-                    return Poll::Ready(Some(Err(WebSocketError::InvalidFrameError)));
-                }
+                // no need to check for bad continuation flags because its caught by the framing layer
 
                 let prev_partial_utf8 = self.staggered_utf8.take();
 
-                let current_partial_utf8 = split_off_partial_utf8(&mut payload);
+                let current_partial_utf8 = match split_off_partial_utf8(&mut payload) {
+                    Ok(v) => Some(v),
+                    Err(SplitOffPartialError::NoPartialCodePoint) => None,
+                    Err(SplitOffPartialError::InvalidUtf8) => {
+                        return Poll::Ready(Some(Err(WebSocketError::InvalidFrame(
+                            InvalidFrameReason::BadUtf8,
+                        ))));
+                    }
+                };
 
                 if let Some(prepend) = prev_partial_utf8 {
                     payload.splice(0..0, prepend.into_iter());
                 }
 
-                self.staggered_utf8 = Some(current_partial_utf8);
+                self.staggered_utf8 = current_partial_utf8;
                 self.fin = fin;
 
                 Poll::Ready(Some(Ok(MessageFragment::Text(
-                    String::from_utf8(payload).map_err(|_| WebSocketError::InvalidFrameError)?,
+                    String::from_utf8(payload)
+                        .map_err(|_| WebSocketError::InvalidFrame(InvalidFrameReason::BadUtf8))?,
                 ))))
             }
         }
@@ -504,6 +502,79 @@ impl Sink<Message> for WebSocketWriteHalf {
     }
 }
 
+/// Events sent from the read half to the write half
+#[derive(Debug)]
+pub(super) enum Event {
+    SendPongFrame(Frame),
+    SendCloseFrameAndShutdown(Frame),
+}
+
+/// Splits off any partial utf8 characters from a string (!) buffer.
+fn split_off_partial_utf8(vec: &mut Vec<u8>) -> Result<Vec<u8>, SplitOffPartialError> {
+    let bytes_from_end = vec.iter().rev().copied();
+
+    // number of bytes belonging to a potentially partial code point, found in the current buffer.
+    let mut number_partial = 0usize;
+    for byte in bytes_from_end {
+        // if byte start of multi byte code point
+        if (byte & 0b111 == 0b110) || (byte & 0b1111 == 0b1110) || (byte & 0b11111 == 0b11110) {
+            // count result
+            number_partial += 1;
+            // stop iterating
+            break;
+        }
+
+        // If partial code point abruptly stops or no multi byte code point exists in general
+        if byte & 0b11 != 0b10 {
+            return Err(if number_partial == 0 {
+                // there were no continuation bytes.
+                SplitOffPartialError::NoPartialCodePoint
+            } else {
+                // multi byte code point abruptly stops without a starting byte.
+                SplitOffPartialError::InvalidUtf8
+            });
+        }
+
+        number_partial += 1;
+    }
+
+    // get the length in bytes of the last code point
+    let code_point_len: usize = {
+        let byte = vec
+            .iter()
+            .skip(vec.len() - number_partial)
+            .next()
+            .unwrap_or_else(|| unreachable!());
+
+        if byte & 0b11111 == 0b11110 {
+            4
+        } else if byte & 0b1111 == 0b1110 {
+            3
+        } else if byte & 0b111 == 0b110 {
+            2
+        } else {
+            // no if statement for a validity check as it would have been weeded out by now.
+            1
+        }
+    };
+
+    // check if last code point collected is partial
+    if code_point_len < number_partial {
+        // More continuation bytes than the byte prescribes
+        Err(SplitOffPartialError::InvalidUtf8)
+    } else if code_point_len == number_partial {
+        Err(SplitOffPartialError::NoPartialCodePoint)
+    } else {
+        // do the thing
+        Ok(vec.split_off(vec.len() - number_partial))
+    }
+}
+
+enum SplitOffPartialError {
+    NoPartialCodePoint,
+    InvalidUtf8,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,16 +586,4 @@ mod tests {
         WebSocketWriteHalf: Send + Sync,
     {
     }
-}
-
-/// Events sent from the read half to the write half
-#[derive(Debug)]
-pub(super) enum Event {
-    SendPongFrame(Frame),
-    SendCloseFrameAndShutdown(Frame),
-}
-
-/// Splits off any partial utf8 characters from a string (!) buffer.
-fn split_off_partial_utf8(vec: &mut Vec<u8>) -> Vec<u8> {
-    todo!()
 }

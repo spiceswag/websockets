@@ -46,16 +46,16 @@ pub enum WebSocketError {
     // frame errors
     /// Attempted to use a control frame whose payload is more than 125 bytes
     #[error("control frame has payload larger than 125 bytes")]
-    ControlFrameTooLargeError,
+    ControlFrameTooLarge,
     /// Attempted to use a frame whose payload is too large
     #[error("payload is too large")]
-    PayloadTooLargeError,
+    PayloadTooLarge,
     /// Received an invalid frame
     #[error("received frame is invalid")]
-    InvalidFrameError,
+    InvalidFrame(InvalidFrameReason),
     /// Received a masked frame from the server
     #[error("received masked frame")]
-    ReceivedMaskedFrameError,
+    ReceivedMaskedFrame,
 
     // url errors
     /// URL could not be parsed
@@ -91,6 +91,29 @@ pub enum WebSocketError {
     ChannelError,
 }
 
+/// Delineation between types of malformed frames.
+#[derive(Debug)]
+pub enum InvalidFrameReason {
+    /// The peer sent a continuation frame even though
+    /// the previous message has finished with the `fin` flag
+    FalseContinuation,
+
+    /// The close code included inside of a `Close` frame.
+    BadCloseCode,
+
+    /// The peer sent a frame whose payload length specifier is 128 (127 max).
+    BadPayloadLength,
+    /// The payload length of a close frame was set to `1`.
+    BadCloseFramePayload,
+    /// The peer sent a text frame containing invalid UTF-8.
+    BadUtf8,
+
+    /// The peer sent a frame whose opcode is reserved for a data frame.
+    ReservedDataOpcode,
+    /// The peer sent a frame whose opcode is reserved for a control frame.
+    ReservedControlOpcode,
+}
+
 /// A newtype to that implements [`From<std::io::Error>`]
 /// and converts them to `WebSocketError::ReadError`
 ///
@@ -103,6 +126,10 @@ impl From<std::io::Error> for WsReadError {
     }
 }
 
+/// A newtype to that implements [`From<std::io::Error>`]
+/// and converts them to `WebSocketError::WriteError`
+///
+/// Useful for implementing the `Decoder` trait from `tokio_util`.
 pub(crate) struct WsWriteError(pub WebSocketError);
 
 impl From<std::io::Error> for WsWriteError {

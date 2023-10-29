@@ -7,7 +7,7 @@ use tokio_util::codec::{Decoder, Encoder};
 
 #[allow(unused_imports)] // for intra doc links
 use super::WebSocket;
-use crate::error::{WebSocketError, WsReadError, WsWriteError};
+use crate::error::{InvalidFrameReason, WebSocketError, WsReadError, WsWriteError};
 
 const U16_MAX_MINUS_ONE: usize = (u16::MAX - 1) as usize;
 const U16_MAX: usize = u16::MAX as usize;
@@ -75,7 +75,7 @@ impl Decoder for WsFrameCodec {
         };
 
         if masked {
-            return Err(WsReadError(WebSocketError::ReceivedMaskedFrameError));
+            return Err(WsReadError(WebSocketError::ReceivedMaskedFrame));
         }
 
         let payload_length = match length_specifier {
@@ -100,11 +100,15 @@ impl Decoder for WsFrameCodec {
                 std::io::Read::read(&mut src, &mut buf).unwrap();
                 u64::from_be_bytes(buf) as usize
             }
-            _ => return Err(WsReadError(WebSocketError::InvalidFrameError)),
+            _ => {
+                return Err(WsReadError(WebSocketError::InvalidFrame(
+                    InvalidFrameReason::BadPayloadLength,
+                )))
+            }
         };
 
         if payload_length > MAX_PAYLOAD_SIZE {
-            return Err(WsReadError(WebSocketError::PayloadTooLargeError));
+            return Err(WsReadError(WebSocketError::PayloadTooLarge));
         }
 
         if src.get_ref().len() < src.position() as usize + payload_length {
@@ -142,7 +146,9 @@ impl Decoder for WsFrameCodec {
                         fin,
                     }))
                 }
-                _ => Err(WsReadError(WebSocketError::InvalidFrameError)),
+                _ => Err(WsReadError(WebSocketError::InvalidFrame(
+                    InvalidFrameReason::FalseContinuation,
+                ))),
             },
             0x1 => {
                 if !fin {
@@ -167,22 +173,23 @@ impl Decoder for WsFrameCodec {
                 }))
             }
             // reserved data frames
-            0x3..=0x7 => Err(WsReadError(WebSocketError::InvalidFrameError)),
+            0x3..=0x7 => Err(WsReadError(WebSocketError::InvalidFrame(
+                InvalidFrameReason::ReservedDataOpcode,
+            ))),
             0x8 if payload_length == 0 => Ok(Some(Frame::Close { payload: None })),
             // if there is a payload it must have a u16 status code
-            0x8 if payload_length < 2 => Err(WsReadError(WebSocketError::InvalidFrameError)),
+            0x8 if payload_length < 2 => Err(WsReadError(WebSocketError::InvalidFrame(
+                InvalidFrameReason::BadCloseFramePayload,
+            ))),
             0x8 => {
                 let (status_code, reason) = payload.split_at(2);
-                let status_code = u16::from_be_bytes(
-                    status_code
-                        .try_into()
-                        .map_err(|_e| WsReadError(WebSocketError::InvalidFrameError))?,
-                );
+                let status_code = u16::from_be_bytes(status_code.try_into().unwrap());
                 Ok(Some(Frame::Close {
                     payload: Some((
                         status_code,
-                        String::from_utf8(reason.to_vec())
-                            .map_err(|_e| WsReadError(WebSocketError::InvalidFrameError))?,
+                        String::from_utf8(reason.to_vec()).map_err(|_e| {
+                            WsReadError(WebSocketError::InvalidFrame(InvalidFrameReason::BadUtf8))
+                        })?,
                     )),
                 }))
             }
@@ -195,7 +202,11 @@ impl Decoder for WsFrameCodec {
                 payload: Some(payload),
             })),
             // reserved control frames
-            0xB..=0xFF => return Err(WsReadError(WebSocketError::InvalidFrameError)),
+            0xB..=0xFF => {
+                return Err(WsReadError(WebSocketError::InvalidFrame(
+                    InvalidFrameReason::ReservedControlOpcode,
+                )))
+            }
         }
     }
 }
@@ -228,7 +239,7 @@ impl Encoder<Frame> for WsFrameCodec {
         };
         // control frame cannot be longer than 125 bytes: https://tools.ietf.org/html/rfc6455#section-5.5
         if is_control && payload.len() > 125 {
-            return Err(WsWriteError(WebSocketError::ControlFrameTooLargeError));
+            return Err(WsWriteError(WebSocketError::ControlFrameTooLarge));
         }
 
         // set payload len: https://tools.ietf.org/html/rfc6455#section-5.2
@@ -247,7 +258,7 @@ impl Encoder<Frame> for WsFrameCodec {
                 payload_len_data.extend_from_slice(&(payload.len() as u64).to_be_bytes());
                 payload_len_data
             }
-            _ => return Err(WsWriteError(WebSocketError::PayloadTooLargeError)),
+            _ => return Err(WsWriteError(WebSocketError::PayloadTooLarge)),
         };
         payload_len_data[0] += 0b10000000; // set masking bit: https://tools.ietf.org/html/rfc6455#section-5.3
         dst.extend_from_slice(&payload_len_data);

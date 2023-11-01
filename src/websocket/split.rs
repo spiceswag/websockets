@@ -16,7 +16,7 @@ use super::socket::Socket;
 use super::WebSocket;
 use crate::batched::{Batched, Prioritized};
 use crate::error::{InvalidFrame, WebSocketError, WsWriteError};
-use crate::ops::{ClosePayload, Pong};
+use crate::ops::{ClosePayload, PingPayload, Pong};
 
 /// The read half of a WebSocket connection, generated from [`WebSocket::split()`].
 /// This half can only receive frames.
@@ -30,10 +30,10 @@ pub struct WebSocketReadHalf {
     /// Should always be `None` when not waiting for frames.
     pub(super) partial_message: Option<IncompleteMessage>,
 
-    ///
-    pub(super) pong_receiver: Receiver<oneshot::Sender<Option<Vec<u8>>>>,
+    /// A receiver for pong future handles.
+    pub(super) pong_receiver: Receiver<oneshot::Sender<PingPayload>>,
     /// A list of handles for waking up pong futures.
-    pub(super) pongs: Vec<oneshot::Sender<Option<Vec<u8>>>>,
+    pub(super) pongs: Vec<oneshot::Sender<PingPayload>>,
 }
 
 impl WebSocketReadHalf {
@@ -61,7 +61,9 @@ impl WebSocketReadHalf {
     /// Wake up pong futures by their handles
     fn wake_up_pongs(&mut self, payload: Option<Vec<u8>>) {
         self.pongs.drain(..).for_each(|sender| {
-            let _ = sender.send(payload.clone());
+            let _ = sender.send(PingPayload {
+                payload: payload.as_ref().filter(|vec| !vec.is_empty()).cloned(),
+            });
         });
     }
 }
@@ -311,7 +313,7 @@ pub struct WebSocketWriteHalf {
     pub(super) sent_closed: bool,
 
     /// Send pong wake up handles
-    pub(super) pong_sender: Sender<oneshot::Sender<Option<Vec<u8>>>>,
+    pub(super) pong_sender: Sender<oneshot::Sender<PingPayload>>,
 }
 
 impl WebSocketWriteHalf {

@@ -32,17 +32,24 @@ use crate::{error::InvalidFrame, WebSocketError};
 /// https://datatracker.ietf.org/doc/html/rfc6455#section-5.5.3
 #[derive(Debug)]
 pub struct Pong {
-    pub(super) recv: oneshot::Receiver<Option<Vec<u8>>>,
+    pub(super) recv: oneshot::Receiver<PingPayload>,
 }
 
 impl Future for Pong {
-    type Output = Option<Vec<u8>>;
+    type Output = Option<PingPayload>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.recv
-            .poll_unpin(cx)
-            .map(|res| res.expect("Pong future polled after the relevant websocket is closed"))
+        self.recv.poll_unpin(cx).map(|res| res.ok())
     }
+}
+
+/// The contents of a `Ping`/`Pong` frame
+///
+/// https://datatracker.ietf.org/doc/html/rfc6455#section-5.5.3
+#[derive(Debug)]
+pub struct PingPayload {
+    /// Optional application data contained in a `Ping`.
+    pub payload: Option<Vec<u8>>,
 }
 
 /// How a WebSocket connection was closed.

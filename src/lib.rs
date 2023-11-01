@@ -52,7 +52,10 @@ pub use websocket::{builder::WebSocketBuilder, WebSocket};
 
 #[cfg(test)]
 mod tests {
-    use crate::*;
+    use crate::{
+        ops::{ClosePayload, Status},
+        *,
+    };
 
     #[tokio::test]
     async fn echo_length_0_to_125() {
@@ -100,12 +103,18 @@ mod tests {
 
     #[tokio::test]
     async fn close() {
-        let mut ws = WebSocket::connect("wss://echo.websocket.org")
+        let ws = WebSocket::connect("wss://echo.websocket.org")
             .await
             .unwrap();
-        ws.close(Some((1000, String::new()))).await.unwrap();
-        let status_code = ws.receive().await.unwrap().as_close().unwrap().0;
-        assert_eq!(status_code, 1000);
+        let res = ws
+            .close(Some(ClosePayload {
+                status: Status::Ok,
+                reason: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(res.unwrap().status, Status::Ok);
     }
 
     #[tokio::test]

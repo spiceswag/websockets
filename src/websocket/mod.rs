@@ -7,14 +7,23 @@ mod parsed_addr;
 mod socket;
 pub mod split;
 
-use std::task::{ready, Poll};
+use std::{
+    convert::TryInto,
+    task::{ready, Poll},
+    time::Duration,
+};
 
 use crate::error::WebSocketError;
 use builder::WebSocketBuilder;
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use split::{WebSocketReadHalf, WebSocketWriteHalf};
+use tokio::time::timeout;
 
-use self::{message::Message, ops::Pong};
+use self::{
+    frame::Frame,
+    message::Message,
+    ops::{CloseOutcome, ClosePayload, Pong, Status},
+};
 
 /// Manages the WebSocket connection; used to connect, send data, and receive data.
 ///
@@ -154,14 +163,6 @@ impl WebSocket {
         self.send(Message::Binary(payload)).await
     }
 
-    /// Sends a Close frame over the WebSocket connection, constructed
-    /// from passed arguments, and closes the WebSocket connection.
-    /// This method will attempt to wait for an echoed Close frame,
-    /// which is returned.
-    pub async fn close(mut self, payload: Option<(u16, String)>) -> Result<(), WebSocketError> {
-        self.inner.write.close(payload).await
-    }
-
     /// Sends a Ping frame over the WebSocket connection, constructed
     /// from passed arguments.
     ///
@@ -174,9 +175,61 @@ impl WebSocket {
         self.inner.write.send_ping(payload).await
     }
 
-    /// Shuts down the WebSocket connection **without sending a Close frame**.
-    /// It is recommended to use the [`close()`](WebSocket::close()) method instead.
-    pub async fn drop(mut self) -> Result<(), WebSocketError> {
+    /// Sends a Close frame over the WebSocket connection, constructed
+    /// from passed arguments, and closes the WebSocket connection.
+    /// This method will attempt to wait for an echoed Close frame,
+    /// which is returned.
+    ///
+    /// # Data Loss
+    ///
+    /// Data sent by the server after starting the shutdown sequence will be lost.
+    /// If this is not desirable use `todo` instead
+    pub async fn close(
+        self,
+        payload: Option<ClosePayload>,
+    ) -> Result<CloseOutcome, WebSocketError> {
+        self.inner.write.close(payload).await?;
+        let mut read = self.inner.read.stream;
+
+        let timeout = timeout(Duration::from_secs(5), async move {
+            loop {
+                match read.next().await {
+                    None => {
+                        return Ok::<CloseOutcome, WebSocketError>(CloseOutcome::Normal(
+                            ClosePayload {
+                                status: Status::MissingStatusCode,
+                                reason: None,
+                            },
+                        ))
+                    }
+                    Some(Err(err)) => return Err(err.0),
+                    Some(Ok(frame)) => match frame {
+                        Frame::Close { payload: None } => {
+                            return Ok(CloseOutcome::Normal(ClosePayload {
+                                status: Status::MissingStatusCode,
+                                reason: None,
+                            }))
+                        }
+                        Frame::Close {
+                            payload: Some((status, reason)),
+                        } => {
+                            return Ok(CloseOutcome::Normal(ClosePayload {
+                                status: status.try_into()?,
+                                reason: Some(reason).filter(|s| !s.is_empty()),
+                            }))
+                        }
+                        _ => {}
+                    },
+                }
+            }
+        });
+
+        timeout.await.ok().unwrap_or(Ok(CloseOutcome::TimeOut))
+    }
+
+    /// Shuts down the send half of the TCP connection **without** sending a close frame.
+    /// The read half of the socket remains functional however, and can still be read.
+    pub async fn drop(&mut self) -> Result<(), WebSocketError> {
         self.inner.write.drop().await
     }
 

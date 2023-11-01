@@ -52,10 +52,14 @@ pub enum WebSocketError {
     PayloadTooLarge,
     /// Received an invalid frame
     #[error("received frame is invalid")]
-    InvalidFrame(InvalidFrameReason),
+    InvalidFrame(InvalidFrame),
     /// Received a masked frame from the server
     #[error("received masked frame")]
     ReceivedMaskedFrame,
+    /// Tried to send a `Close` frame with an invalid status code,
+    /// or one that is not allowed to be sent.
+    #[error("tried to send bad or illegal status")]
+    BadStatus,
 
     // url errors
     /// URL could not be parsed
@@ -93,7 +97,7 @@ pub enum WebSocketError {
 
 /// Delineation between types of malformed frames.
 #[derive(Debug)]
-pub enum InvalidFrameReason {
+pub enum InvalidFrame {
     /// The peer sent a continuation frame even though
     /// the previous message has finished with the `fin` flag
     FalseContinuation,

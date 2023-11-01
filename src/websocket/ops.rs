@@ -10,7 +10,7 @@ use std::{
 };
 use tokio::sync::oneshot;
 
-use crate::{error::InvalidFrameReason, WebSocketError};
+use crate::{error::InvalidFrame, WebSocketError};
 
 /// A futures that resolves as soon as a
 /// pong message is received from the server.
@@ -45,20 +45,29 @@ impl Future for Pong {
     }
 }
 
-/// A future that resolves when the remote peer acknowledges
-/// a `Close` frame or drops its send half of the socket.
-///
-/// # Data Loss
-///
-/// Data frames received while waiting for the close acknowledgement
-/// packet from the server will be lost.
-///
-/// If this is unacceptable, opt for TODO
-///
-/// https://datatracker.ietf.org/doc/html/rfc6455#section-7
-#[derive(Debug)]
-pub struct Close<'a> {
-    todo: std::marker::PhantomData<&'a ()>,
+/// How a WebSocket connection was closed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CloseOutcome {
+    /// The WebSocket connection was closed normally.
+    Normal(ClosePayload),
+    /// The server took too long to reply with a `Close` frame,
+    /// or took too long to shut down the TCP connection,
+    /// so the client acted first.
+    TimeOut,
+}
+
+impl CloseOutcome {
+    /// Unwrap the outcome assuming it was a normal closure, or panic otherwise.
+    ///
+    /// # Panics
+    ///
+    /// This method panics if `self` is equal to [`CloseOutcome::TimeOut`]
+    pub fn unwrap(self) -> ClosePayload {
+        match self {
+            Self::Normal(p) => p,
+            Self::TimeOut => panic!("unwrap called on a time out close outcome"),
+        }
+    }
 }
 
 /// The body of a close frame, consisting of a status code
@@ -67,7 +76,7 @@ pub struct Close<'a> {
 /// the application communicating.
 ///
 /// https://datatracker.ietf.org/doc/html/rfc6455#section-5.5.1
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ClosePayload {
     /// The closing status for this payload.
     pub status: Status,
@@ -81,7 +90,7 @@ pub struct ClosePayload {
 ///
 /// That means you can not use this enum in combination with any other API of this crate
 /// to cause an active WebSocket connection to enter an invalid state.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Status {
     /// The purpose of the websocket has been fulfilled.
     ///
@@ -187,14 +196,24 @@ pub enum Status {
     PrivateStatus(u16),
 }
 
+impl Status {
+    /// If the status code can be sent through the WebSocket.
+    pub fn sendable(&self) -> bool {
+        match self {
+            Self::MissingStatusCode => false,
+            Self::AbnormalShutdown => false,
+            Self::TlsFailure => false,
+            _ => true,
+        }
+    }
+}
+
 impl TryFrom<u16> for Status {
     type Error = WebSocketError;
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
-            0..=999 => Err(WebSocketError::InvalidFrame(
-                InvalidFrameReason::BadCloseCode,
-            )),
+            0..=999 => Err(WebSocketError::InvalidFrame(InvalidFrame::BadCloseCode)),
 
             1000 => Ok(Self::Ok),
             1001 => Ok(Self::GoingAway),
@@ -215,9 +234,30 @@ impl TryFrom<u16> for Status {
             3000..=3999 => Ok(Self::RegisteredStatus(value)),
             4000..=4999 => Ok(Self::PrivateStatus(value)),
 
-            _ => Err(WebSocketError::InvalidFrame(
-                InvalidFrameReason::BadCloseCode,
-            )),
+            _ => Err(WebSocketError::InvalidFrame(InvalidFrame::BadCloseCode)),
+        }
+    }
+}
+
+impl Into<u16> for Status {
+    fn into(self) -> u16 {
+        use Status::*;
+
+        match self {
+            Ok => 1000,
+            GoingAway => 1001,
+            ProtocolError => 1002,
+            UnacceptableData => 1003,
+            MissingStatusCode => 1005,
+            AbnormalShutdown => 1006,
+            InvalidData => 1007,
+            PolicyViolation => 1008,
+            MessageTooLarge => 1009,
+            InsufficientExtensions => 1010,
+            ServerError => 1011,
+            TlsFailure => 1015,
+            RegisteredStatus(v) => v,
+            PrivateStatus(v) => v,
         }
     }
 }

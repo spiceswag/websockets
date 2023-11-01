@@ -7,7 +7,7 @@ use tokio_util::codec::{Decoder, Encoder};
 
 #[allow(unused_imports)] // for intra doc links
 use super::WebSocket;
-use crate::error::{InvalidFrameReason, WebSocketError, WsReadError, WsWriteError};
+use crate::error::{InvalidFrame, WebSocketError, WsReadError, WsWriteError};
 
 const U16_MAX_MINUS_ONE: usize = (u16::MAX - 1) as usize;
 const U16_MAX: usize = u16::MAX as usize;
@@ -102,7 +102,7 @@ impl Decoder for WsFrameCodec {
             }
             _ => {
                 return Err(WsReadError(WebSocketError::InvalidFrame(
-                    InvalidFrameReason::BadPayloadLength,
+                    InvalidFrame::BadPayloadLength,
                 )))
             }
         };
@@ -147,7 +147,7 @@ impl Decoder for WsFrameCodec {
                     }))
                 }
                 _ => Err(WsReadError(WebSocketError::InvalidFrame(
-                    InvalidFrameReason::FalseContinuation,
+                    InvalidFrame::FalseContinuation,
                 ))),
             },
             0x1 => {
@@ -174,12 +174,12 @@ impl Decoder for WsFrameCodec {
             }
             // reserved data frames
             0x3..=0x7 => Err(WsReadError(WebSocketError::InvalidFrame(
-                InvalidFrameReason::ReservedDataOpcode,
+                InvalidFrame::ReservedDataOpcode,
             ))),
             0x8 if payload_length == 0 => Ok(Some(Frame::Close { payload: None })),
             // if there is a payload it must have a u16 status code
             0x8 if payload_length < 2 => Err(WsReadError(WebSocketError::InvalidFrame(
-                InvalidFrameReason::BadCloseFramePayload,
+                InvalidFrame::BadCloseFramePayload,
             ))),
             0x8 => {
                 let (status_code, reason) = payload.split_at(2);
@@ -188,7 +188,7 @@ impl Decoder for WsFrameCodec {
                     payload: Some((
                         status_code,
                         String::from_utf8(reason.to_vec()).map_err(|_e| {
-                            WsReadError(WebSocketError::InvalidFrame(InvalidFrameReason::BadUtf8))
+                            WsReadError(WebSocketError::InvalidFrame(InvalidFrame::BadUtf8))
                         })?,
                     )),
                 }))
@@ -204,7 +204,7 @@ impl Decoder for WsFrameCodec {
             // reserved control frames
             0xB..=0xFF => {
                 return Err(WsReadError(WebSocketError::InvalidFrame(
-                    InvalidFrameReason::ReservedControlOpcode,
+                    InvalidFrame::ReservedControlOpcode,
                 )))
             }
         }

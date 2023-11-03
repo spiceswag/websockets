@@ -206,7 +206,7 @@ pub enum MessageFragment {
 
 /// A message in the middle of reconstruction.
 #[derive(Debug)]
-pub(crate) enum IncompleteMessage {
+pub enum IncompleteMessage {
     Text(Vec<u8>),
     Binary(Vec<u8>),
 }

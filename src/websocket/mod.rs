@@ -22,7 +22,7 @@ use tokio::time::timeout;
 use self::{
     frame::Frame,
     message::Message,
-    ops::{CloseOutcome, ClosePayload, Pong, Status},
+    ops::{CloseOutcome, ClosePayload, ClosingFrames, Pong, Status},
 };
 
 /// Manages the WebSocket connection; used to connect, send data, and receive data.
@@ -101,7 +101,7 @@ use self::{
 ///
 /// # Splitting
 ///
-/// To facilitate simulataneous reads and writes, the `WebSocket` can be split
+/// To facilitate simultaneous reads and writes, the `WebSocket` can be split
 /// into a [read half](WebSocketReadHalf) and a [write half](WebSocketWriteHalf).
 /// The read half allows frames to be received, while the write half
 /// allows frames to be sent.
@@ -183,7 +183,7 @@ impl WebSocket {
     /// # Data Loss
     ///
     /// Data sent by the server after starting the shutdown sequence will be lost.
-    /// If this is not desirable use `todo` instead
+    /// If this is not desirable use `close_catching` instead.
     pub async fn close(
         self,
         payload: Option<ClosePayload>,
@@ -225,6 +225,19 @@ impl WebSocket {
         });
 
         timeout.await.ok().unwrap_or(Ok(CloseOutcome::TimeOut))
+    }
+
+    /// Sends a Close frame over the WebSocket connection, constructed
+    /// from passed arguments, and closes the WebSocket connection.
+    ///
+    /// This method returns a [`Stream`] that catches all frames sent by the server,
+    /// after the client sends a `Close` frame.
+    pub async fn close_catching(
+        self,
+        payload: Option<ClosePayload>,
+    ) -> Result<ClosingFrames, WebSocketError> {
+        self.inner.write.close(payload).await?;
+        Ok(ClosingFrames::new(self.inner.read))
     }
 
     /// Shuts down the send half of the TCP connection **without** sending a close frame.

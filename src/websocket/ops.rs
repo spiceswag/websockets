@@ -1,16 +1,29 @@
 //! Operations on web sockets with custom future implementations.
 //! This includes closing the websocket, and pinging the peer.
 
-use futures::FutureExt;
+use futures::{ready, FutureExt, Stream, StreamExt};
 use std::{
-    convert::TryFrom,
+    convert::{TryFrom, TryInto},
     future::Future,
     pin::Pin,
     task::{Context, Poll},
+    time::Duration,
 };
-use tokio::sync::oneshot;
+use tokio::{
+    io::{BufReader, ReadHalf},
+    select,
+    sync::oneshot,
+    time::Sleep,
+};
+use tokio_util::codec::FramedRead;
 
-use crate::{error::InvalidFrame, WebSocketError};
+use crate::{error::InvalidFrame, Message, WebSocketError, WebSocketReadHalf};
+
+use super::{
+    frame::{Frame, WsFrameCodec},
+    message::IncompleteMessage,
+    socket::Socket,
+};
 
 /// A futures that resolves as soon as a
 /// pong message is received from the server.
@@ -50,6 +63,184 @@ impl Future for Pong {
 pub struct PingPayload {
     /// Optional application data contained in a `Ping`.
     pub payload: Option<Vec<u8>>,
+}
+
+/// Close a WebSocket while also catching the last frames sent by the server!
+/// This is the data loss proof alternative to [`WebSocket::close`].
+#[derive(Debug)]
+pub struct ClosingFrames {
+    read: FramedRead<BufReader<ReadHalf<Socket>>, WsFrameCodec>,
+    /// Part of a message that has not fully been received yet.
+    partial_message: Option<IncompleteMessage>,
+
+    /// If the server has echoed a `Close` frame, this field is `Some`, `None` otherwise
+    complete: Option<ClosePayload>,
+
+    /// When the server should have closed the connection by.
+    /// If not met, the client drops the TCP connection on its own.
+    timeout: Pin<Box<Sleep>>,
+}
+
+impl ClosingFrames {
+    pub(crate) fn new(read: WebSocketReadHalf) -> Self {
+        ClosingFrames {
+            read: read.stream,
+            partial_message: read.partial_message,
+            complete: None,
+            timeout: Box::pin(tokio::time::sleep(Duration::from_secs(5))),
+        }
+    }
+
+    /// If the WebSocket has been closed, this method returns
+    /// any leftover parts from the last data message, if it was not received in full.
+    pub fn remainder(&mut self) -> Option<IncompleteMessage> {
+        // if the connection is not done
+        if self.complete.is_none() {
+            return None;
+        }
+
+        self.partial_message.take()
+    }
+
+    /// Wait until the server echoes the `Close` frame and closes the TCP connection.
+    ///
+    /// # Data Loss
+    ///
+    /// Data send by the server which have not been received will be lost.
+    /// If this is undesirable just read the [`Stream`] to its end.
+    pub async fn close(self) -> Result<CloseOutcome, WebSocketError> {
+        let Self {
+            mut read,
+            complete,
+            timeout,
+            ..
+        } = self;
+
+        if let Some(payload) = complete {
+            return Ok(CloseOutcome::Normal(payload));
+        }
+
+        let wait_for_close = async move {
+            loop {
+                match read.next().await {
+                    None => {
+                        return Ok::<CloseOutcome, WebSocketError>(CloseOutcome::Normal(
+                            ClosePayload {
+                                status: Status::MissingStatusCode,
+                                reason: None,
+                            },
+                        ))
+                    }
+                    Some(Err(err)) => return Err(err.0),
+                    Some(Ok(frame)) => match frame {
+                        Frame::Close { payload: None } => {
+                            return Ok(CloseOutcome::Normal(ClosePayload {
+                                status: Status::MissingStatusCode,
+                                reason: None,
+                            }))
+                        }
+                        Frame::Close {
+                            payload: Some((status, reason)),
+                        } => {
+                            return Ok(CloseOutcome::Normal(ClosePayload {
+                                status: status.try_into()?,
+                                reason: Some(reason).filter(|s| !s.is_empty()),
+                            }))
+                        }
+                        _ => {}
+                    },
+                }
+            }
+        };
+
+        select! {
+            res = wait_for_close => res,
+            _ = timeout => Ok(CloseOutcome::TimeOut)
+        }
+    }
+}
+
+impl Stream for ClosingFrames {
+    type Item = Result<Message, WebSocketError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.complete.is_some() {
+            return Poll::Ready(None);
+        }
+
+        // piece together a frame
+
+        let frame = match ready!(self.read.poll_next_unpin(cx)) {
+            Some(Ok(f)) => f,
+            Some(Err(err)) => return Poll::Ready(Some(Err(err.0))),
+            None => return Poll::Ready(None),
+        };
+
+        match frame {
+            Frame::Close { payload } => {
+                self.complete = Some(match payload {
+                    Some((status, reason)) => ClosePayload {
+                        status: Status::try_from(status)?,
+                        reason: Some(reason).filter(|s| !s.is_empty()),
+                    },
+                    None => ClosePayload {
+                        status: Status::MissingStatusCode,
+                        reason: None,
+                    },
+                });
+                Poll::Ready(None)
+            }
+
+            Frame::Binary {
+                payload,
+                continuation,
+                fin,
+            } => {
+                let complete = match self.partial_message.take() {
+                    Some(IncompleteMessage::Binary(mut prev_payloads)) if continuation => {
+                        prev_payloads.extend(payload.iter());
+                        prev_payloads
+                    }
+                    // into_owned() is ok because received frames are 'static
+                    None if !continuation => payload,
+                    _ => unreachable!(),
+                };
+
+                if fin {
+                    Poll::Ready(Some(Ok(Message::Binary(complete))))
+                } else {
+                    self.partial_message = Some(IncompleteMessage::Binary(complete));
+                    Poll::Pending
+                }
+            }
+            Frame::Text {
+                payload,
+                continuation,
+                fin,
+            } => {
+                let complete = match self.partial_message.take() {
+                    Some(IncompleteMessage::Text(mut prev_payloads)) if continuation => {
+                        prev_payloads.extend(payload);
+                        prev_payloads
+                    }
+                    None if !continuation => payload,
+                    _ => unreachable!(),
+                };
+
+                if fin {
+                    Poll::Ready(Some(Ok(Message::Text(
+                        String::from_utf8(complete).map_err(|_| {
+                            WebSocketError::InvalidFrame(crate::error::InvalidFrame::BadUtf8)
+                        })?,
+                    ))))
+                } else {
+                    self.partial_message = Some(IncompleteMessage::Text(complete));
+                    Poll::Pending
+                }
+            }
+            _ => Poll::Pending,
+        }
+    }
 }
 
 /// How a WebSocket connection was closed.

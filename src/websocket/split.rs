@@ -26,8 +26,6 @@ pub struct WebSocketReadHalf {
     pub(super) sender: Sender<Event>,
 
     /// Part of a message that has not fully been received yet.
-    ///
-    /// Should always be `None` when not waiting for frames.
     pub(super) partial_message: Option<IncompleteMessage>,
 
     /// A receiver for pong future handles.

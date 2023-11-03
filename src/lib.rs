@@ -59,9 +59,7 @@ mod tests {
 
     #[tokio::test]
     async fn echo_length_0_to_125() {
-        let mut ws = WebSocket::connect("ws://echo.websocket.org/")
-            .await
-            .unwrap();
+        let mut ws = WebSocket::connect("ws://ws.ifelse.io/").await.unwrap();
         let message = "a".repeat(3).to_string();
         ws.send_text(message.clone()).await.unwrap();
         let received_message = ws.receive().await.unwrap().as_text().unwrap();
@@ -70,9 +68,7 @@ mod tests {
 
     #[tokio::test]
     async fn echo_length_126_to_u16_max() {
-        let mut ws = WebSocket::connect("ws://echo.websocket.org/")
-            .await
-            .unwrap();
+        let mut ws = WebSocket::connect("ws://ws.ifelse.io/").await.unwrap();
         let message = "a".repeat(300).to_string();
         ws.send_text(message.clone()).await.unwrap();
         let received_message = ws.receive().await.unwrap().as_text().unwrap();
@@ -81,9 +77,7 @@ mod tests {
 
     #[tokio::test]
     async fn echo_length_u16_max_to_u64_max() {
-        let mut ws = WebSocket::connect("ws://echo.websocket.org/")
-            .await
-            .unwrap();
+        let mut ws = WebSocket::connect("ws://ws.ifelse.io/").await.unwrap();
         let message = "a".repeat(66000).to_string();
         ws.send_text(message.clone()).await.unwrap();
         let received_message = ws.receive().await.unwrap().as_text().unwrap();
@@ -92,9 +86,7 @@ mod tests {
 
     #[tokio::test]
     async fn echo_tls() {
-        let mut ws = WebSocket::connect("wss://echo.websocket.org/")
-            .await
-            .unwrap();
+        let mut ws = WebSocket::connect("wss://ws.ifelse.io/").await.unwrap();
         let message = "a".repeat(66000).to_string();
         ws.send_text(message.clone()).await.unwrap();
         let received_message = ws.receive().await.unwrap().as_text().unwrap();
@@ -103,9 +95,7 @@ mod tests {
 
     #[tokio::test]
     async fn close() {
-        let ws = WebSocket::connect("wss://echo.websocket.org")
-            .await
-            .unwrap();
+        let ws = WebSocket::connect("wss://ws.ifelse.io").await.unwrap();
         let res = ws
             .close(Some(ClosePayload {
                 status: Status::Ok,
@@ -119,7 +109,7 @@ mod tests {
 
     #[tokio::test]
     async fn bad_scheme() {
-        let resp = WebSocket::connect("http://echo.websocket.org").await;
+        let resp = WebSocket::connect("http://ws.ifelse.io").await;
         if let Ok(_) = resp {
             panic!("expected to fail with bad scheme");
         }

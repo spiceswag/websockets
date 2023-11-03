@@ -122,6 +122,7 @@ pub enum InvalidFrame {
 /// and converts them to `WebSocketError::ReadError`
 ///
 /// Useful for implementing the `Decoder` trait from `tokio_util`.
+#[derive(Debug)]
 pub(crate) struct WsReadError(pub WebSocketError);
 
 impl From<std::io::Error> for WsReadError {
@@ -134,6 +135,7 @@ impl From<std::io::Error> for WsReadError {
 /// and converts them to `WebSocketError::WriteError`
 ///
 /// Useful for implementing the `Decoder` trait from `tokio_util`.
+#[derive(Debug)]
 pub(crate) struct WsWriteError(pub WebSocketError);
 
 impl From<std::io::Error> for WsWriteError {

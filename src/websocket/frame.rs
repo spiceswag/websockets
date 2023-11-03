@@ -26,6 +26,10 @@ pub(crate) struct WsFrameCodec {
     last_frame_type: Option<FrameType>,
     // send
     rng: ChaCha20Rng,
+
+    /// If the testing flag is set, no masking will be done during encoding.
+    #[cfg(test)]
+    testing: bool,
 }
 
 impl WsFrameCodec {
@@ -34,6 +38,20 @@ impl WsFrameCodec {
         Self {
             last_frame_type: None,
             rng: ChaCha20Rng::from_entropy(),
+            #[cfg(test)]
+            testing: false,
+        }
+    }
+
+    /// Create a WebSocket frame decoder.
+    ///
+    /// This method produces an encoder which does not mask frames.
+    #[cfg(test)]
+    fn new_no_masking() -> Self {
+        Self {
+            last_frame_type: None,
+            rng: ChaCha20Rng::from_entropy(),
+            testing: true,
         }
     }
 }
@@ -43,7 +61,10 @@ impl Decoder for WsFrameCodec {
     type Error = WsReadError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        // todo: buffer management
         use std::io::Cursor;
+
+        // Includes `fin`, `opcode`, `masked` and `length_specifier`
         if src.len() < 2 {
             // 16 bits
             return Ok(None);
@@ -69,7 +90,7 @@ impl Decoder for WsFrameCodec {
             let byte = read_u8(&mut src).unwrap();
 
             let masked = byte & 0b10000000_u8 != 0;
-            let length = (byte & 0b01111111_u8) << 1;
+            let length = byte & 0b01111111_u8;
 
             (masked, length)
         };
@@ -81,6 +102,7 @@ impl Decoder for WsFrameCodec {
         let payload_length = match length_specifier {
             0..=125 => length_specifier as usize,
             126 => {
+                // Includes two flag bytes, and 2 length bytes
                 if src.get_ref().len() < 4 {
                     // 32 bits
                     return Ok(None);
@@ -91,6 +113,7 @@ impl Decoder for WsFrameCodec {
                 u16::from_be_bytes(buf) as usize
             }
             127 => {
+                // Includes two flag bytes and 8 length bytes
                 if src.get_ref().len() < 10 {
                     // 80 bits
                     return Ok(None);
@@ -111,6 +134,7 @@ impl Decoder for WsFrameCodec {
             return Err(WsReadError(WebSocketError::PayloadTooLarge));
         }
 
+        // if available bytes are less than the expected frame length (current cursor position plus the payload data length)
         if src.get_ref().len() < src.position() as usize + payload_length {
             return Ok(None);
         }
@@ -260,20 +284,92 @@ impl Encoder<Frame> for WsFrameCodec {
             }
             _ => return Err(WsWriteError(WebSocketError::PayloadTooLarge)),
         };
-        payload_len_data[0] += 0b10000000; // set masking bit: https://tools.ietf.org/html/rfc6455#section-5.3
+
+        #[cfg(test)]
+        if !self.testing {
+            payload_len_data[0] += 0b10000000; // set masking bit: https://tools.ietf.org/html/rfc6455#section-5.3
+        } else {
+            payload_len_data[0] += 0b00000000;
+        }
+
+        #[cfg(not(test))]
+        {
+            payload_len_data[0] += 0b10000000; // set masking bit: https://tools.ietf.org/html/rfc6455#section-5.3
+        }
+
         dst.extend_from_slice(&payload_len_data);
 
-        // payload masking: https://tools.ietf.org/html/rfc6455#section-5.3
-        let mut masking_key = vec![0; 4];
-        self.rng.fill_bytes(&mut masking_key);
-        for (i, byte) in payload.iter_mut().enumerate() {
-            *byte = *byte ^ (masking_key[i % 4]);
+        #[cfg(test)]
+        if !self.testing {
+            // payload masking: https://tools.ietf.org/html/rfc6455#section-5.3
+            let mut masking_key = vec![0; 4];
+            self.rng.fill_bytes(&mut masking_key);
+            for (i, byte) in payload.iter_mut().enumerate() {
+                *byte = *byte ^ (masking_key[i % 4]);
+            }
+            dst.extend_from_slice(&masking_key);
         }
-        dst.extend_from_slice(&masking_key);
+
+        #[cfg(not(test))]
+        {
+            // payload masking: https://tools.ietf.org/html/rfc6455#section-5.3
+            let mut masking_key = vec![0; 4];
+            self.rng.fill_bytes(&mut masking_key);
+            for (i, byte) in payload.iter_mut().enumerate() {
+                *byte = *byte ^ (masking_key[i % 4]);
+            }
+            dst.extend_from_slice(&masking_key);
+        }
 
         dst.extend_from_slice(&payload);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio_util::{
+        bytes::BytesMut,
+        codec::{Decoder, Encoder},
+    };
+
+    use super::{Frame, WsFrameCodec};
+
+    #[test]
+    fn round_trip_text() {
+        let input = Frame::Text {
+            payload: "Lorem ipsum dolor sit amet, consectetur adipiscing elit".into(),
+            continuation: false,
+            fin: false,
+        };
+
+        let mut codec = WsFrameCodec::new_no_masking();
+        let mut frame_buf = BytesMut::new();
+
+        codec.encode(input.clone(), &mut frame_buf).unwrap();
+
+        let output = codec.decode(&mut frame_buf).unwrap().unwrap();
+
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn round_trip_bytes() {
+        let input = Frame::Binary {
+            payload: "Lorem ipsum dolor sit amet, consectetur adipiscing elit".into(),
+            continuation: false,
+            fin: false,
+        };
+
+        let mut codec = WsFrameCodec::new_no_masking();
+        let mut frame_buf = BytesMut::new();
+
+        codec.encode(input.clone(), &mut frame_buf).unwrap();
+
+        let output = codec.decode(&mut frame_buf).unwrap().unwrap();
+
+        assert_eq!(input, output);
     }
 }
 
@@ -303,7 +399,7 @@ impl Encoder<Frame> for WsFrameCodec {
 /// `false` and `fin` set to `false`, all other frames except the last frame should
 /// have `continuation` set to `true` and `fin` set to `false`, and the last frame should
 /// have `continuation` set to `true` and `fin` set to `true`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
     /// A Text frame
     Text {

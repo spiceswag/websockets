@@ -6,6 +6,7 @@ use native_tls::{
 };
 use tokio::io::{self, BufReader};
 use tokio::net::TcpStream;
+use tokio_util::bytes::BytesMut;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use super::frame::WsFrameCodec;
@@ -83,17 +84,31 @@ impl WebSocketBuilder {
             _ => return Err(WebSocketError::SchemeError),
         };
 
+        // perform opening handshake
+        let handshake = Handshake::new(
+            &parsed_addr,
+            &self.additional_handshake_headers,
+            &self.subprotocols,
+        );
+
+        let (stream, extra_bytes) = handshake.send(stream).await?;
+
         let (event_sender, event_receiver) = flume::unbounded();
         let (pong_handle_sender, pong_handle_receiver) = flume::unbounded();
 
         let (read_half, write_half) = io::split(stream);
-        let mut ws = WebSocket {
+
+        let mut read = FramedRead::new(BufReader::new(read_half), WsFrameCodec::new());
+        let mut new_buffer = BytesMut::new();
+        new_buffer.reserve(extra_bytes.len() + read.read_buffer().len());
+        new_buffer.extend(extra_bytes.iter());
+        new_buffer.extend(read.read_buffer().iter());
+
+        *read.read_buffer_mut() = new_buffer;
+
+        Ok(WebSocket {
             inner: FlushingWs {
-                read: WebSocketReadHalf::new(
-                    FramedRead::new(BufReader::new(read_half), WsFrameCodec::new()),
-                    event_sender,
-                    pong_handle_receiver,
-                ),
+                read: WebSocketReadHalf::new(read, event_sender, pong_handle_receiver),
                 write: WebSocketWriteHalf {
                     stream: Batched::new(FramedWrite::new(write_half, WsFrameCodec::new()), 16),
                     fragmentation: self.fragmentation,
@@ -106,22 +121,7 @@ impl WebSocketBuilder {
             },
             accepted_subprotocol: None,
             handshake_response_headers: None,
-        };
-
-        // perform opening handshake
-        let handshake = Handshake::new(
-            &parsed_addr,
-            &self.additional_handshake_headers,
-            &self.subprotocols,
-        );
-        handshake.send_request(&mut ws).await?;
-        match handshake.check_response(&mut ws).await {
-            Ok(_) => Ok(ws.into()),
-            Err(e) => {
-                ws.drop().await?;
-                Err(e)
-            }
-        }
+        })
     }
 
     /// Define the fragmentation strategy employed by this websocket.

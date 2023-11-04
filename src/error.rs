@@ -29,18 +29,18 @@ pub enum WebSocketError {
     ShutdownError(IoError),
 
     // handshake errors
-    /// Invalid handshake response from the server
-    #[error("invalid handshake response")]
-    InvalidHandshakeError,
+    /// Failed to send a handshake request, or to process the response.
+    #[error("failed to send a handshake request, or to process the response")]
+    HandshakeError(hyper::Error),
     /// The server rejected the handshake request
     #[error("server rejected handshake")]
-    HandshakeFailedError {
+    HandshakeFailed {
         /// Status code from the server's handshake response
         status_code: String,
         /// Headers from the server's handshake response
-        headers: Vec<(String, String)>,
+        headers: Vec<(String, Vec<u8>)>,
         /// Body of the server's handshake response, if any
-        body: Option<String>,
+        body: Vec<u8>,
     },
 
     // frame errors

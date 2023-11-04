@@ -1,24 +1,22 @@
-use futures::SinkExt;
+use http_body_util::{BodyExt, Empty};
+use hyper::{
+    body::Bytes,
+    client::conn::http1,
+    header::{CONNECTION, HOST, UPGRADE},
+    upgrade::Parts,
+    Request, StatusCode,
+};
+use hyper_util::rt::TokioIo;
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
-use regex::Regex;
-use sha1::{Digest, Sha1};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, WriteHalf};
-use tokio_util::codec::FramedWrite;
 
-use super::{
-    frame::{Frame, WsFrameCodec},
-    parsed_addr::ParsedAddr,
-    socket::Socket,
-};
-use crate::{batched::Batched, error::WebSocketError, WebSocket};
+use crate::WebSocketError;
 
-const GUUID: &'static str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+use super::{parsed_addr::ParsedAddr, socket::Socket};
 
 #[derive(Debug)]
 pub(super) struct Handshake {
-    path: String,
-    host: String,
+    addr: ParsedAddr,
     key: String,
     version: usize,
     additional_headers: Vec<(String, String)>,
@@ -37,8 +35,7 @@ impl Handshake {
         rng.fill_bytes(&mut rand_bytes);
         let key = base64::encode(rand_bytes);
         Self {
-            path: parsed_addr.path.clone(),
-            host: parsed_addr.host.clone(),
+            addr: parsed_addr.clone(),
             key,
             // todo: support more versions
             version: 13,
@@ -47,200 +44,80 @@ impl Handshake {
         }
     }
 
-    // todo move to a normal http library cuz this is
-    // sketchy as all hell
+    /// Perform a WebSocket handshake on the given socket.
+    pub async fn send(&self, stream: Socket) -> Result<(Socket, Bytes), WebSocketError> {
+        let mut uri = self.addr.clone();
 
-    pub async fn send_request(&self, ws: &mut WebSocket) -> Result<(), WebSocketError> {
-        // https://tools.ietf.org/html/rfc6455#section-1.3
-        // https://tools.ietf.org/html/rfc6455#section-4.1
-        /*
-        let mut headers = Vec::new();
-        headers.push(("Host".to_string(), self.host.clone()));
-        headers.push(("Upgrade".to_string(), "websocket".to_string()));
-        headers.push(("Connection".to_string(), "Upgrade".to_string()));
-        headers.push(("Sec-WebSocket-Key".to_string(), self.key.clone()));
-        headers.push((
-            "Sec-Websocket-Version".to_string(),
-            self.version.to_string(),
-        ));
-        if self.subprotocols.len() > 0 {
-            headers.push((
-                "Sec-WebSocket-Protocol".to_string(),
-                self.subprotocols.join(", "),
-            ));
-        }
-        for header in &self.additional_headers {
-            headers.push(header.clone());
-        }
-
-        let mut req = format!("GET {} HTTP/1.1\r\n", self.path);
-        for (field, value) in headers {
-            req.push_str(&format!("{}: {}\r\n", field, value));
-        }
-        req.push_str("\r\n"); // end of request
-
-        ws.inner
-            .write
-            .stream
-            .get_mut()
-            .get_mut()
-            .write_all(req.as_bytes())
+        let io = TokioIo::new(stream);
+        let (mut sender, connection) = http1::handshake(io)
             .await
-            .map_err(|e| WebSocketError::WriteError(e))?;
-        // flushing on the framed write is equivalent with flushing the raw stream
-        <Batched<FramedWrite<WriteHalf<Socket>, WsFrameCodec>, Frame> as SinkExt<Frame>>::flush(
-            &mut ws.inner.write.stream,
-        )
-        .await
-        .map_err(|err| err.0)?;
-        Ok(())
-        */
+            .map_err(WebSocketError::HandshakeError)?;
 
-        todo!()
-    }
-
-    pub async fn check_response(&self, ws: &mut WebSocket) -> Result<(), WebSocketError> {
-        // https://tools.ietf.org/html/rfc6455#section-1.3
-        // https://tools.ietf.org/html/rfc6455#section-4.2.2
-
-        /*
-        let status_line_regex = Regex::new(r"HTTP/\d+\.\d+ (?P<status_code>\d{3}) .+\r\n").unwrap();
-        let mut status_line = String::new();
-
-        ws.inner
-            .read
-            .stream
-            .get_mut()
-            .read_line(&mut status_line)
-            .await
-            .map_err(|e| WebSocketError::ReadError(e))?;
-        let captures = status_line_regex
-            .captures(&status_line)
-            .ok_or(WebSocketError::InvalidHandshakeError)?;
-        let status_code = &captures["status_code"];
-
-        let mut headers = Vec::new();
-        let headers_regex = Regex::new(r"(?P<field>.+?):\s*(?P<value>.*?)\s*\r\n").unwrap();
-        loop {
-            let mut header = String::new();
-            ws.inner
-                .read
-                .stream
-                .get_mut()
-                .read_line(&mut header)
-                .await
-                .map_err(|e| WebSocketError::ReadError(e))?;
-            match headers_regex.captures(&header) {
-                Some(captures) => {
-                    let field = &captures["field"];
-                    let value = &captures["value"];
-                    headers.push((field.to_string(), value.to_string()));
-                }
-                None => break, // field is empty, so the header is finished (we got double crlf)
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                println!("Connection failed: {:?}", err);
             }
+        });
+
+        uri.scheme = match uri.scheme.as_ref() {
+            "ws" => "http".to_string(),
+            "wss" => "https".to_string(),
+            _ => unreachable!(),
+        };
+
+        let mut req_builder = Request::builder()
+            .uri(Into::<String>::into(uri))
+            .header(
+                HOST,
+                format!("{}:{}", self.addr.host.clone(), self.addr.addr.port()),
+            )
+            .header(UPGRADE, "websocket")
+            .header(CONNECTION, "Upgrade")
+            .header("Sec-WebSocket-Key", &self.key)
+            .header("Sec-WebSocket-Version", self.version);
+
+        if !self.subprotocols.is_empty() {
+            req_builder =
+                req_builder.header("Sec-WebSocket-Protocol", self.subprotocols.join(", "));
         }
 
-        // check status code
-        if status_code != "101" {
-            let body = match headers
-                .iter()
-                .find(|(field, _value)| field.to_lowercase() == "content-length")
-            {
-                Some(header) => {
-                    let body_length = header
-                        .1
-                        .parse::<usize>()
-                        .map_err(|_e| WebSocketError::InvalidHandshakeError)?;
-                    let mut body = vec![0; body_length];
-                    ws.inner
-                        .read
-                        .stream
-                        .get_mut()
-                        .read_exact(&mut body)
-                        .await
-                        .map_err(|e| WebSocketError::ReadError(e))?;
-                    Some(
-                        String::from_utf8(body)
-                            .map_err(|_e| WebSocketError::InvalidHandshakeError)?,
-                    )
-                }
-                None => None,
-            };
-            return Err(WebSocketError::HandshakeFailedError {
-                status_code: status_code.to_string(),
-                headers,
-                body,
+        for (header_name, header_value) in &self.additional_headers {
+            req_builder = req_builder.header(header_name, header_value);
+        }
+
+        let req = req_builder.body(Empty::<Bytes>::new()).unwrap();
+
+        let res = sender
+            .send_request(req)
+            .await
+            .map_err(WebSocketError::HandshakeError)?;
+
+        if res.status() != StatusCode::SWITCHING_PROTOCOLS {
+            return Err(WebSocketError::HandshakeFailed {
+                status_code: res.status().to_string(),
+                headers: res
+                    .headers()
+                    .into_iter()
+                    .map(|(name, value)| (name.to_string(), value.as_bytes().to_owned()))
+                    .collect(),
+                body: res
+                    .collect()
+                    .await
+                    .map_err(WebSocketError::HandshakeError)?
+                    .to_bytes()
+                    .into(),
             });
         }
 
-        // check upgrade field
-        let upgrade = headers
-            .iter()
-            .find(|(field, _value)| field.to_lowercase() == "upgrade")
-            .ok_or(WebSocketError::InvalidHandshakeError)?
-            .1
-            .clone();
-        if upgrade.to_lowercase() != "websocket" {
-            return Err(WebSocketError::InvalidHandshakeError);
-        }
+        let upgraded = hyper::upgrade::on(res)
+            .await
+            .map_err(WebSocketError::HandshakeError)?;
 
-        // check connection field
-        let connection = headers
-            .iter()
-            .find(|(field, _value)| field.to_lowercase() == "connection")
-            .ok_or(WebSocketError::InvalidHandshakeError)?
-            .1
-            .clone();
-        if connection.to_lowercase() != "upgrade" {
-            return Err(WebSocketError::InvalidHandshakeError);
-        }
+        let parts: Parts<TokioIo<Socket>> = upgraded.downcast().unwrap_or_else(|_| unreachable!());
 
-        // check extensions
-        if let Some(_) = headers
-            .iter()
-            .find(|(field, _value)| field.to_lowercase() == "sec-websocket-extensions")
-        {
-            // extensions not supported
-            return Err(WebSocketError::InvalidHandshakeError);
-        }
+        let io = parts.io.into_inner();
+        let buf = parts.read_buf;
 
-        // check subprotocols
-        let possible_subprotocol = headers
-            .iter()
-            .find(|(field, _value)| field.to_lowercase() == "sec-websocket-protocol")
-            .map(|(_field, value)| value.clone());
-        match (possible_subprotocol, self.subprotocols.len()) {
-            // server accepted a subprotocol that was not specified
-            (Some(_), 0) => return Err(WebSocketError::InvalidHandshakeError),
-            // server accepted a subprotocol that may have been specified
-            (Some(subprotocol), _) => {
-                if self.subprotocols.contains(&subprotocol) {
-                    ws.accepted_subprotocol = Some(subprotocol)
-                } else {
-                    return Err(WebSocketError::InvalidHandshakeError);
-                }
-            }
-            // server did not accept a subprotocol, whether one was specified or not
-            (None, _) => (),
-        }
-
-        // validate key
-        let accept_key = headers
-            .iter()
-            .find(|(field, _value)| field.to_lowercase() == "sec-websocket-accept")
-            .ok_or(WebSocketError::InvalidHandshakeError)?
-            .1
-            .clone();
-        let mut test_key = self.key.clone();
-        test_key.push_str(GUUID);
-        let hashed: [u8; 20] = Sha1::digest(test_key.as_bytes()).into();
-        let calculated_accept_key = base64::encode(hashed);
-        if accept_key != calculated_accept_key {
-            return Err(WebSocketError::InvalidHandshakeError);
-        }
-
-        ws.handshake_response_headers = Some(headers);
-        */
-        todo!()
+        Ok((io, buf))
     }
 }

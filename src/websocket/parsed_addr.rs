@@ -5,7 +5,7 @@ use url::Url;
 
 use crate::WebSocketError;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct ParsedAddr {
     pub scheme: String,
     pub host: String,
@@ -35,5 +35,14 @@ impl TryFrom<&str> for ParsedAddr {
             path: path.to_string(),
             addr,
         })
+    }
+}
+
+impl Into<String> for ParsedAddr {
+    fn into(self) -> String {
+        let Self {
+            scheme, host, path, ..
+        } = self;
+        format!("{scheme}://{host}/{path}")
     }
 }

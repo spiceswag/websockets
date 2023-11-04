@@ -35,6 +35,10 @@ pub struct WebSocketReadHalf {
     /// Part of a message that has not fully been received yet.
     /// Should be `None` if the stream is being managed by a [`FragmentedMessage`]
     partial_message: Option<IncompleteMessage>,
+
+    /// If the stream is in the middle of receiving a fragmented message,
+    /// but the FragmentedMessage struct was dropped.
+    recovering: bool,
 }
 
 impl WebSocketReadHalf {
@@ -116,6 +120,26 @@ impl Stream for WebSocketReadHalf {
         };
 
         self.collect_pongs();
+
+        if self.recovering {
+            match &frame {
+                Frame::Text { fin, .. } => {
+                    if *fin {
+                        self.recovering = false;
+                    } else {
+                        return Poll::Pending;
+                    }
+                }
+                Frame::Binary { fin, .. } => {
+                    if *fin {
+                        self.recovering = false;
+                    } else {
+                        return Poll::Pending;
+                    }
+                }
+                _ => {}
+            }
+        }
 
         match frame {
             Frame::Ping { payload } => {
@@ -209,6 +233,11 @@ impl WebSocketReadHalf {
 ///
 /// Useful for large messages where it is more optimal to process it as it
 /// comes in, rather than all at once.
+///
+/// # Data Loss
+///
+/// When dropping this structure, if the message is not finished,
+/// the rest of that message's frames are lost.
 #[derive(Debug)]
 pub struct FragmentedMessage<'a> {
     /// The handle to the web socket read half
@@ -236,6 +265,32 @@ impl<'a> Stream for FragmentedMessage<'a> {
     ) -> Poll<Option<Self::Item>> {
         if self.fin {
             return Poll::Ready(None);
+        }
+
+        if let Some(partial_message) = self.read.partial_message.take() {
+            return Poll::Ready(Some(Ok(match partial_message {
+                IncompleteMessage::Binary(payload) => MessageFragment::Binary(payload),
+                IncompleteMessage::Text(mut payload) => {
+                    // self.staggered_utf8 must be None at this point
+
+                    let current_partial_utf8 = match split_off_partial_utf8(&mut payload) {
+                        Ok(v) => Some(v),
+                        Err(SplitOffPartialError::NoPartialCodePoint) => None,
+                        Err(SplitOffPartialError::InvalidUtf8) => {
+                            return Poll::Ready(Some(Err(WebSocketError::InvalidFrame(
+                                InvalidFrame::BadUtf8,
+                            ))));
+                        }
+                    };
+
+                    self.staggered_utf8 = current_partial_utf8;
+
+                    MessageFragment::Text(
+                        String::from_utf8(payload)
+                            .map_err(|_| WebSocketError::InvalidFrame(InvalidFrame::BadUtf8))?,
+                    )
+                }
+            })));
         }
 
         let frame = match ready!(self.read.stream.poll_next_unpin(cx)) {
@@ -320,7 +375,9 @@ impl<'a> FusedStream for FragmentedMessage<'a> {
 
 impl<'a> Drop for FragmentedMessage<'a> {
     fn drop(&mut self) {
-        todo!()
+        if !self.fin {
+            self.read.recovering = true;
+        }
     }
 }
 

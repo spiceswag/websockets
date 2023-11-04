@@ -73,6 +73,10 @@ pub struct ClosingFrames {
     /// Part of a message that has not fully been received yet.
     partial_message: Option<IncompleteMessage>,
 
+    /// If the stream is in the middle of receiving a fragmented message,
+    /// but the FragmentedMessage struct was dropped.
+    recovering: bool,
+
     /// If the server has echoed a `Close` frame, this field is `Some`, `None` otherwise
     complete: Option<ClosePayload>,
 
@@ -83,11 +87,12 @@ pub struct ClosingFrames {
 
 impl ClosingFrames {
     pub(crate) fn new(read: WebSocketReadHalf) -> Self {
-        let (read, partial_message) = read.into_parts();
+        let (read, partial_message, recovering) = read.into_parts();
 
         ClosingFrames {
             read,
             partial_message,
+            recovering,
             complete: None,
             timeout: Box::pin(tokio::time::sleep(Duration::from_secs(5))),
         }
@@ -177,6 +182,26 @@ impl Stream for ClosingFrames {
             Some(Err(err)) => return Poll::Ready(Some(Err(err.0))),
             None => return Poll::Ready(None),
         };
+
+        if self.recovering {
+            match &frame {
+                Frame::Text { fin, .. } => {
+                    if *fin {
+                        self.recovering = false;
+                    } else {
+                        return Poll::Pending;
+                    }
+                }
+                Frame::Binary { fin, .. } => {
+                    if *fin {
+                        self.recovering = false;
+                    } else {
+                        return Poll::Pending;
+                    }
+                }
+                _ => {}
+            }
+        }
 
         match frame {
             Frame::Close { payload } => {

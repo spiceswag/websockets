@@ -62,6 +62,10 @@ mod tests {
         let mut ws = WebSocket::connect("ws://ws.ifelse.io/").await.unwrap();
         let message = "a".repeat(3).to_string();
         ws.send_text(message.clone()).await.unwrap();
+
+        // the first message sent by this echo server implementation is a server identifer
+        ws.receive().await.unwrap();
+
         let received_message = ws.receive().await.unwrap().as_text().unwrap();
         assert_eq!(message, received_message);
     }
@@ -71,6 +75,10 @@ mod tests {
         let mut ws = WebSocket::connect("ws://ws.ifelse.io/").await.unwrap();
         let message = "a".repeat(300).to_string();
         ws.send_text(message.clone()).await.unwrap();
+
+        // the first message sent by this echo server implementation is a server identifer
+        ws.receive().await.unwrap();
+
         let received_message = ws.receive().await.unwrap().as_text().unwrap();
         assert_eq!(message, received_message);
     }
@@ -80,6 +88,10 @@ mod tests {
         let mut ws = WebSocket::connect("ws://ws.ifelse.io/").await.unwrap();
         let message = "a".repeat(66000).to_string();
         ws.send_text(message.clone()).await.unwrap();
+
+        // the first message sent by this echo server implementation is a server identifer
+        ws.receive().await.unwrap();
+
         let received_message = ws.receive().await.unwrap().as_text().unwrap();
         assert_eq!(message, received_message);
     }
@@ -89,6 +101,10 @@ mod tests {
         let mut ws = WebSocket::connect("wss://ws.ifelse.io/").await.unwrap();
         let message = "a".repeat(66000).to_string();
         ws.send_text(message.clone()).await.unwrap();
+
+        // the first message sent by this echo server implementation is a server identifer
+        ws.receive().await.unwrap();
+
         let received_message = ws.receive().await.unwrap().as_text().unwrap();
         assert_eq!(message, received_message);
     }

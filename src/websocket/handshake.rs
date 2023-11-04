@@ -47,9 +47,13 @@ impl Handshake {
         }
     }
 
+    // todo move to a normal http library cuz this is
+    // sketchy as all hell
+
     pub async fn send_request(&self, ws: &mut WebSocket) -> Result<(), WebSocketError> {
         // https://tools.ietf.org/html/rfc6455#section-1.3
         // https://tools.ietf.org/html/rfc6455#section-4.1
+        /*
         let mut headers = Vec::new();
         headers.push(("Host".to_string(), self.host.clone()));
         headers.push(("Upgrade".to_string(), "websocket".to_string()));
@@ -90,11 +94,16 @@ impl Handshake {
         .await
         .map_err(|err| err.0)?;
         Ok(())
+        */
+
+        todo!()
     }
 
     pub async fn check_response(&self, ws: &mut WebSocket) -> Result<(), WebSocketError> {
         // https://tools.ietf.org/html/rfc6455#section-1.3
         // https://tools.ietf.org/html/rfc6455#section-4.2.2
+
+        /*
         let status_line_regex = Regex::new(r"HTTP/\d+\.\d+ (?P<status_code>\d{3}) .+\r\n").unwrap();
         let mut status_line = String::new();
 
@@ -231,6 +240,7 @@ impl Handshake {
         }
 
         ws.handshake_response_headers = Some(headers);
-        Ok(())
+        */
+        todo!()
     }
 }

@@ -5,7 +5,26 @@ pub mod message;
 pub mod ops;
 mod parsed_addr;
 mod socket;
-pub mod split;
+pub mod split {
+    mod read;
+    pub use read::*;
+
+    mod write;
+    pub use write::*;
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn assert_send_sync()
+        where
+            WebSocketReadHalf: Send + Sync,
+            WebSocketWriteHalf: Send + Sync,
+        {
+        }
+    }
+}
 
 use std::{
     convert::TryInto,

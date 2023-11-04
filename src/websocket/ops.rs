@@ -83,9 +83,11 @@ pub struct ClosingFrames {
 
 impl ClosingFrames {
     pub(crate) fn new(read: WebSocketReadHalf) -> Self {
+        let (read, partial_message) = read.into_parts();
+
         ClosingFrames {
-            read: read.stream,
-            partial_message: read.partial_message,
+            read,
+            partial_message,
             complete: None,
             timeout: Box::pin(tokio::time::sleep(Duration::from_secs(5))),
         }

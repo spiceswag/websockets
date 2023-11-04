@@ -89,13 +89,11 @@ impl WebSocketBuilder {
         let (read_half, write_half) = io::split(stream);
         let mut ws = WebSocket {
             inner: FlushingWs {
-                read: WebSocketReadHalf {
-                    stream: FramedRead::new(BufReader::new(read_half), WsFrameCodec::new()),
-                    sender: event_sender,
-                    partial_message: None,
-                    pong_receiver: pong_handle_receiver,
-                    pongs: vec![],
-                },
+                read: WebSocketReadHalf::new(
+                    FramedRead::new(BufReader::new(read_half), WsFrameCodec::new()),
+                    event_sender,
+                    pong_handle_receiver,
+                ),
                 write: WebSocketWriteHalf {
                     stream: Batched::new(FramedWrite::new(write_half, WsFrameCodec::new()), 16),
                     fragmentation: self.fragmentation,

@@ -208,7 +208,7 @@ impl WebSocket {
         payload: Option<ClosePayload>,
     ) -> Result<CloseOutcome, WebSocketError> {
         self.inner.write.close(payload).await?;
-        let mut read = self.inner.read.stream;
+        let (mut read, _, _) = self.inner.read.into_parts();
 
         let timeout = timeout(Duration::from_secs(5), async move {
             loop {

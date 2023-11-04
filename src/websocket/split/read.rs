@@ -23,19 +23,52 @@ use crate::{
 /// This half can only receive frames.
 #[derive(Debug)]
 pub struct WebSocketReadHalf {
-    pub(crate) stream: FramedRead<BufReader<ReadHalf<Socket>>, WsFrameCodec>,
-    pub(crate) sender: Sender<Event>,
+    stream: FramedRead<BufReader<ReadHalf<Socket>>, WsFrameCodec>,
 
-    /// Part of a message that has not fully been received yet.
-    pub(crate) partial_message: Option<IncompleteMessage>,
+    event_sender: Sender<Event>,
 
     /// A receiver for pong future handles.
-    pub(crate) pong_receiver: Receiver<oneshot::Sender<PingPayload>>,
+    pong_receiver: Receiver<oneshot::Sender<PingPayload>>,
     /// A list of handles for waking up pong futures.
-    pub(crate) pongs: Vec<oneshot::Sender<PingPayload>>,
+    pongs: Vec<oneshot::Sender<PingPayload>>,
+
+    /// Part of a message that has not fully been received yet.
+    /// Should be `None` if the stream is being managed by a [`FragmentedMessage`]
+    partial_message: Option<IncompleteMessage>,
 }
 
 impl WebSocketReadHalf {
+    pub(crate) fn new(
+        stream: FramedRead<BufReader<ReadHalf<Socket>>, WsFrameCodec>,
+        event_sender: Sender<Event>,
+        pong_receiver: Receiver<oneshot::Sender<PingPayload>>,
+    ) -> Self {
+        Self {
+            stream,
+            event_sender,
+            pong_receiver,
+            pongs: vec![],
+            partial_message: None,
+            recovering: false,
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        FramedRead<BufReader<ReadHalf<Socket>>, WsFrameCodec>,
+        Option<IncompleteMessage>,
+        bool,
+    ) {
+        let Self {
+            stream,
+            partial_message,
+            recovering,
+            ..
+        } = self;
+        (stream, partial_message, recovering)
+    }
+
     /// Receives a [`Message`] over the WebSocket connection.
     ///
     /// If the received frame is a Ping frame, an event to send a Pong frame will be queued.
@@ -86,7 +119,7 @@ impl Stream for WebSocketReadHalf {
 
         match frame {
             Frame::Ping { payload } => {
-                self.sender
+                self.event_sender
                     .send(Event::SendPongFrame(Frame::Pong { payload }))
                     .map_err(|_| WebSocketError::ChannelError)?;
 
@@ -98,7 +131,7 @@ impl Stream for WebSocketReadHalf {
             }
 
             Frame::Close { payload } => {
-                self.sender
+                self.event_sender
                     .send(Event::SendCloseFrameAndShutdown(Frame::Close { payload }))
                     .map_err(|_| WebSocketError::ChannelError)?;
                 Poll::Ready(None)
@@ -222,7 +255,7 @@ impl<'a> Stream for FragmentedMessage<'a> {
         match frame {
             Frame::Ping { payload } => {
                 self.read
-                    .sender
+                    .event_sender
                     .send(Event::SendPongFrame(Frame::Pong { payload }))
                     .map_err(|_| WebSocketError::ChannelError)?;
                 Poll::Pending
@@ -234,7 +267,7 @@ impl<'a> Stream for FragmentedMessage<'a> {
 
             Frame::Close { payload } => {
                 self.read
-                    .sender
+                    .event_sender
                     .send(Event::SendCloseFrameAndShutdown(Frame::Close { payload }))
                     .map_err(|_| WebSocketError::ChannelError)?;
                 Poll::Ready(None)

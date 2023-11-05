@@ -2,13 +2,16 @@ use http_body_util::{BodyExt, Empty};
 use hyper::{
     body::Bytes,
     client::conn::http1,
-    header::{CONNECTION, HOST, UPGRADE},
+    header::{
+        CONNECTION, HOST, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, UPGRADE,
+    },
     upgrade::Parts,
     Request, StatusCode,
 };
 use hyper_util::rt::TokioIo;
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
+use sha1::{Digest, Sha1};
 
 use crate::WebSocketError;
 
@@ -73,8 +76,8 @@ impl Handshake {
             )
             .header(UPGRADE, "websocket")
             .header(CONNECTION, "Upgrade")
-            .header("Sec-WebSocket-Key", &self.key)
-            .header("Sec-WebSocket-Version", self.version);
+            .header(SEC_WEBSOCKET_KEY, &self.key)
+            .header(SEC_WEBSOCKET_VERSION, self.version);
 
         if !self.subprotocols.is_empty() {
             req_builder =
@@ -92,22 +95,79 @@ impl Handshake {
             .await
             .map_err(WebSocketError::HandshakeError)?;
 
-        if res.status() != StatusCode::SWITCHING_PROTOCOLS {
-            return Err(WebSocketError::HandshakeFailed {
-                status_code: res.status().to_string(),
-                headers: res
-                    .headers()
-                    .into_iter()
-                    .map(|(name, value)| (name.to_string(), value.as_bytes().to_owned()))
-                    .collect(),
-                body: res
-                    .collect()
-                    .await
-                    .map_err(WebSocketError::HandshakeError)?
-                    .to_bytes()
-                    .into(),
-            });
+        async fn dump_response(res: hyper::Response<hyper::body::Incoming>) -> WebSocketError {
+            let status_code = res.status().to_string();
+            let headers = res
+                .headers()
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value.as_bytes().to_owned()))
+                .collect();
+
+            let chunks = match res.collect().await.map_err(WebSocketError::HandshakeError) {
+                Ok(chunks) => chunks,
+                Err(err) => return err,
+            };
+
+            let body = chunks.to_bytes().into();
+
+            WebSocketError::HandshakeFailed {
+                status_code,
+                headers,
+                body,
+            }
         }
+
+        if res.status() != StatusCode::SWITCHING_PROTOCOLS {
+            return Err(dump_response(res).await);
+        }
+
+        // check Upgrade header
+        if !res
+            .headers()
+            .get(UPGRADE)
+            .map(|v| String::from_utf8(v.as_bytes().to_owned()))
+            .map(|res| res.map(|str| str.eq_ignore_ascii_case("websocket")))
+            .map(|res| res.unwrap_or(false))
+            .unwrap_or(false)
+        {
+            return Err(dump_response(res).await);
+        }
+
+        // check Connection header
+        if !res
+            .headers()
+            .get(CONNECTION)
+            .map(|v| String::from_utf8(v.as_bytes().to_owned()))
+            .map(|res| res.map(|str| str.eq_ignore_ascii_case("upgrade")))
+            .map(|res| res.unwrap_or(false))
+            .unwrap_or(false)
+        {
+            return Err(dump_response(res).await);
+        }
+
+        // check Sec-Websocket-Accept
+        if let Some(sec_websocket_accept) = res.headers().get(SEC_WEBSOCKET_ACCEPT) {
+            let base64_decoded = match base64::decode(sec_websocket_accept.as_bytes()) {
+                Ok(v) => v,
+                Err(_) => return Err(dump_response(res).await),
+            };
+
+            let expected_hash = {
+                let mut hasher = Sha1::new();
+                hasher.update(self.key.as_bytes());
+                hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+                hasher.finalize().to_vec()
+            };
+
+            if base64_decoded != expected_hash {
+                return Err(dump_response(res).await);
+            }
+        } else {
+            return Err(dump_response(res).await);
+        }
+
+        // todo check extensions is empty and subprotocols equal to what we expect
+        // i hate parsing
 
         let upgraded = hyper::upgrade::on(res)
             .await

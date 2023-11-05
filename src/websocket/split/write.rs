@@ -29,48 +29,34 @@ use super::Event;
 ///
 #[derive(Debug)]
 pub struct WebSocketWriteHalf {
-    pub(crate) stream: Batched<FramedWrite<WriteHalf<Transport>, WsFrameCodec>, Frame>,
-    pub(crate) fragmentation: Fragmentation,
+    sink: Batched<FramedWrite<WriteHalf<Transport>, WsFrameCodec>, Frame>,
+    fragmentation: Fragmentation,
 
     /// Event receiver
-    pub(crate) receiver: Receiver<Event>,
+    event_receiver: Receiver<Event>,
     /// A flag that signals that the sink is trying to shut down or already has shut down
-    pub(crate) shutdown: bool,
+    shutdown: bool,
     /// A flag that is raised when we are the first party to send a close frame
-    pub(crate) sent_closed: bool,
+    sent_closed: bool,
 
     /// Send pong wake up handles
-    pub(crate) pong_sender: Sender<oneshot::Sender<PingPayload>>,
+    pong_sender: Sender<oneshot::Sender<PingPayload>>,
 }
 
 impl WebSocketWriteHalf {
-    /// Flushes incoming events from the read half. If the read half received a Ping frame,
-    /// a Pong frame will be sent. If the read half received a Close frame,
-    /// an echoed Close frame will be sent and the WebSocket will close.
-    ///
-    /// See the documentation on the [`WebSocket`](WebSocket#splitting) type for more details
-    /// about events.
-    pub async fn flush_events(&mut self) -> Result<(), WebSocketError> {
-        while let Ok(event) = self.receiver.try_recv() {
-            if self.shutdown {
-                break;
-            }
-            match event {
-                Event::SendPongFrame(frame) => {
-                    self.stream.send(frame).await.map_err(|err| err.0)?
-                }
-                Event::SendCloseFrameAndShutdown(frame) => {
-                    // read half will always send this event if it has received a close frame,
-                    // but if we have sent one already, then we have sent and received a close
-                    // frame, so we will shutdown
-                    if self.sent_closed {
-                        self.stream.send(frame).await.map_err(|err| err.0)?;
-                        self.drop().await?;
-                    }
-                }
-            };
+    pub(crate) fn new(
+        sink: Batched<FramedWrite<WriteHalf<Transport>, WsFrameCodec>, Frame>,
+        event_receiver: Receiver<Event>,
+        pong_sender: Sender<oneshot::Sender<PingPayload>>,
+    ) -> Self {
+        Self {
+            sink,
+            fragmentation: Fragmentation::None,
+            event_receiver,
+            shutdown: false,
+            sent_closed: false,
+            pong_sender,
         }
-        Ok(())
     }
 
     /// Sends a Ping frame over the WebSocket connection, constructed
@@ -90,7 +76,7 @@ impl WebSocketWriteHalf {
 
         let (send, recv) = oneshot::channel();
 
-        self.stream
+        self.sink
             .send(Frame::Ping { payload })
             .await
             .map_err(|err| err.0)?;
@@ -98,6 +84,38 @@ impl WebSocketWriteHalf {
         let _ = self.pong_sender.send(send);
 
         Ok(Pong { recv })
+    }
+
+    /// Flushes incoming events from the read half. If the read half received a Ping frame,
+    /// a Pong frame will be sent. If the read half received a Close frame,
+    /// an echoed Close frame will be sent and the WebSocket will close.
+    ///
+    /// See the documentation on the [`WebSocket`](WebSocket#splitting) type for more details
+    /// about events.
+    pub async fn flush_events(&mut self) -> Result<(), WebSocketError> {
+        while let Ok(event) = self.event_receiver.try_recv() {
+            if self.shutdown {
+                break;
+            }
+            match event {
+                Event::SendPongFrame(frame) => self.sink.send(frame).await.map_err(|err| err.0)?,
+                Event::SendCloseFrameAndShutdown(frame) => {
+                    // read half will always send this event if it has received a close frame,
+                    // but if we have sent one already, then we have sent and received a close
+                    // frame, so we will shutdown
+                    if self.sent_closed {
+                        self.sink.send(frame).await.map_err(|err| err.0)?;
+                        self.drop().await?;
+                    }
+                }
+            };
+        }
+        Ok(())
+    }
+
+    /// Set the fragmentation strategy the WebSocket will use to split large messages.
+    pub fn set_fragmentation(&mut self, strategy: Fragmentation) {
+        self.fragmentation = strategy;
     }
 
     /// Shuts down the send half of the TCP connection **without** sending a close frame.
@@ -134,7 +152,7 @@ impl WebSocketWriteHalf {
         };
 
         // https://tools.ietf.org/html/rfc6455#section-5.5.1
-        self.stream
+        self.sink
             .send(Frame::Close { payload })
             .await
             .map_err(|err| err.0)?;
@@ -156,7 +174,7 @@ impl Sink<Message> for WebSocketWriteHalf {
 
         let frames = self.fragmentation.fragment(item);
 
-        self.stream.start_send_unpin(frames).map_err(|err| err.0)
+        self.sink.start_send_unpin(frames).map_err(|err| err.0)
     }
 
     fn poll_ready(
@@ -173,11 +191,11 @@ impl Sink<Message> for WebSocketWriteHalf {
         }
 
         // try to feed events into the sink
-        while let Ok(event) = self.receiver.try_recv() {
+        while let Ok(event) = self.event_receiver.try_recv() {
             // make sure we're ready for feeding
             match <Batched<FramedWrite<WriteHalf<Transport>, WsFrameCodec>, Frame> as SinkExt<
                 Frame,
-            >>::poll_ready_unpin(&mut self.stream, cx)
+            >>::poll_ready_unpin(&mut self.sink, cx)
             .map_err(|err: WsWriteError| err.0)
             {
                 Poll::Pending => return Poll::Pending,
@@ -188,7 +206,7 @@ impl Sink<Message> for WebSocketWriteHalf {
             match event {
                 Event::SendPongFrame(frame) => {
                     //  events get priority over other frames \/\/\/
-                    self.stream
+                    self.sink
                         .start_send_unpin(Prioritized(frame))
                         .map_err(|err| err.0)?
                 }
@@ -198,7 +216,7 @@ impl Sink<Message> for WebSocketWriteHalf {
                     // frame, so we will shutdown
                     if !self.sent_closed {
                         //     events get priority \/\/\/
-                        self.stream
+                        self.sink
                             .start_send_unpin(Prioritized(frame))
                             .map_err(|err| err.0)?;
 
@@ -213,7 +231,7 @@ impl Sink<Message> for WebSocketWriteHalf {
         // pings and we can't send any actual data in return.
 
         <Batched::<FramedWrite<WriteHalf<Transport>, WsFrameCodec>, Frame> as SinkExt<Frame>>::poll_ready_unpin(
-            &mut self.stream,
+            &mut self.sink,
             cx,
         )
         .map_err(|err| err.0)
@@ -224,7 +242,7 @@ impl Sink<Message> for WebSocketWriteHalf {
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
         <Batched::<FramedWrite<WriteHalf<Transport>, WsFrameCodec>, Frame> as SinkExt<Frame>>::poll_flush_unpin(
-            &mut self.stream,
+            &mut self.sink,
             cx,
         )
             .map_err(|err| err.0)
@@ -238,7 +256,7 @@ impl Sink<Message> for WebSocketWriteHalf {
         self.shutdown = true;
 
         <Batched::<FramedWrite<WriteHalf<Transport>, WsFrameCodec>, Frame> as SinkExt<Frame>>::poll_close_unpin(
-            &mut self.stream,
+            &mut self.sink,
             cx,
         )
             .map_err(|err| err.0)

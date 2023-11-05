@@ -93,35 +93,38 @@ impl WebSocketBuilder {
 
         let (stream, extra_bytes) = handshake.send(stream).await?;
 
+        let (read_half, write_half) = io::split(stream);
+
+        let framed_read = {
+            let mut read = FramedRead::new(BufReader::new(read_half), WsFrameCodec::new());
+            let mut new_buffer = BytesMut::new();
+            new_buffer.reserve(extra_bytes.len() + read.read_buffer().len());
+            new_buffer.extend(extra_bytes.iter());
+            new_buffer.extend(read.read_buffer().iter());
+
+            *read.read_buffer_mut() = new_buffer;
+
+            read
+        };
+
+        let framed_write = Batched::new(FramedWrite::new(write_half, WsFrameCodec::new()), 16);
+
         let (event_sender, event_receiver) = flume::unbounded();
         let (pong_handle_sender, pong_handle_receiver) = flume::unbounded();
 
-        let (read_half, write_half) = io::split(stream);
-
-        let mut read = FramedRead::new(BufReader::new(read_half), WsFrameCodec::new());
-        let mut new_buffer = BytesMut::new();
-        new_buffer.reserve(extra_bytes.len() + read.read_buffer().len());
-        new_buffer.extend(extra_bytes.iter());
-        new_buffer.extend(read.read_buffer().iter());
-
-        *read.read_buffer_mut() = new_buffer;
-
-        Ok(WebSocket {
+        let mut ws = WebSocket {
             inner: FlushingWs {
-                read: WebSocketReadHalf::new(read, event_sender, pong_handle_receiver),
-                write: WebSocketWriteHalf {
-                    stream: Batched::new(FramedWrite::new(write_half, WsFrameCodec::new()), 16),
-                    fragmentation: self.fragmentation,
-                    receiver: event_receiver,
-                    shutdown: false,
-                    sent_closed: false,
-                    pong_sender: pong_handle_sender,
-                },
+                read: WebSocketReadHalf::new(framed_read, event_sender, pong_handle_receiver),
+                write: WebSocketWriteHalf::new(framed_write, event_receiver, pong_handle_sender),
                 received_message: None,
             },
             accepted_subprotocol: None,
             handshake_response_headers: None,
-        })
+        };
+
+        ws.set_fragmentation(self.fragmentation);
+
+        Ok(ws)
     }
 
     /// Define the fragmentation strategy employed by this websocket.

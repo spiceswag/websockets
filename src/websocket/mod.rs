@@ -40,7 +40,7 @@ use tokio::time::timeout;
 
 use self::{
     frame::Frame,
-    message::Message,
+    message::{Fragmentation, Message},
     ops::{CloseOutcome, ClosePayload, ClosingFrames, Pong},
 };
 
@@ -272,6 +272,11 @@ impl WebSocket {
             accepted_subprotocol: None,
             handshake_response_headers: None,
         }
+    }
+
+    /// Set the fragmentation strategy the WebSocket will use to split large messages.
+    pub fn set_fragmentation(&mut self, strategy: Fragmentation) {
+        self.inner.write.set_fragmentation(strategy)
     }
 
     /// Returns the subprotocol that was accepted by the server during the handshake,

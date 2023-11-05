@@ -22,7 +22,7 @@ use crate::{error::InvalidFrame, Message, WebSocketError, WebSocketReadHalf};
 use super::{
     frame::{Frame, WsFrameCodec},
     message::IncompleteMessage,
-    socket::Socket,
+    transport::Transport,
 };
 
 /// A futures that resolves as soon as a
@@ -69,7 +69,7 @@ pub struct PingPayload {
 /// This is the data loss proof alternative to [`WebSocket::close`].
 #[derive(Debug)]
 pub struct ClosingFrames {
-    read: FramedRead<BufReader<ReadHalf<Socket>>, WsFrameCodec>,
+    read: FramedRead<BufReader<ReadHalf<Transport>>, WsFrameCodec>,
     /// Part of a message that has not fully been received yet.
     partial_message: Option<IncompleteMessage>,
 

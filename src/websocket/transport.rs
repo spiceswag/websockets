@@ -9,12 +9,12 @@ use tokio_native_tls::{TlsConnector as TokioTlsConnector, TlsStream};
 use crate::error::WebSocketError;
 
 #[derive(Debug)]
-pub(crate) enum Socket {
+pub(crate) enum Transport {
     Plain(TcpStream),
     Tls(TlsStream<TcpStream>),
 }
 
-impl Socket {
+impl Transport {
     pub async fn into_tls(
         self,
         host: &str,
@@ -27,7 +27,7 @@ impl Socket {
                     .connect(host, tcp_stream)
                     .await
                     .map_err(|e| WebSocketError::TlsConnectionError(e))?;
-                Ok(Socket::Tls(tls_stream))
+                Ok(Transport::Tls(tls_stream))
             }
             Self::Tls(_) => Ok(self),
         }
@@ -48,7 +48,7 @@ impl Socket {
     // }
 }
 
-impl AsyncRead for Socket {
+impl AsyncRead for Transport {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -61,7 +61,7 @@ impl AsyncRead for Socket {
     }
 }
 
-impl AsyncWrite for Socket {
+impl AsyncWrite for Transport {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

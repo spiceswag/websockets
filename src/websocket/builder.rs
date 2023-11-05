@@ -13,8 +13,8 @@ use super::frame::WsFrameCodec;
 use super::handshake::Handshake;
 use super::message::Fragmentation;
 use super::parsed_addr::ParsedAddr;
-use super::socket::Socket;
 use super::split::{WebSocketReadHalf, WebSocketWriteHalf};
+use super::transport::Transport;
 use super::{FlushingWs, WebSocket};
 use crate::batched::Batched;
 use crate::error::WebSocketError;
@@ -65,7 +65,7 @@ impl WebSocketBuilder {
     pub async fn connect(self, url: &str) -> Result<WebSocket, WebSocketError> {
         let parsed_addr = ParsedAddr::try_from(url)?;
 
-        let stream = Socket::Plain(
+        let stream = Transport::Plain(
             TcpStream::connect(parsed_addr.addr)
                 .await
                 .map_err(|e| WebSocketError::TcpConnectionError(e))?,

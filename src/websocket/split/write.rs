@@ -12,7 +12,7 @@ use crate::{
     websocket::{
         frame::{Frame, WsFrameCodec},
         message::Fragmentation,
-        socket::Socket,
+        transport::Transport,
     },
     Message, WebSocketError,
 };
@@ -29,7 +29,7 @@ use super::Event;
 ///
 #[derive(Debug)]
 pub struct WebSocketWriteHalf {
-    pub(crate) stream: Batched<FramedWrite<WriteHalf<Socket>, WsFrameCodec>, Frame>,
+    pub(crate) stream: Batched<FramedWrite<WriteHalf<Transport>, WsFrameCodec>, Frame>,
     pub(crate) fragmentation: Fragmentation,
 
     /// Event receiver
@@ -175,11 +175,10 @@ impl Sink<Message> for WebSocketWriteHalf {
         // try to feed events into the sink
         while let Ok(event) = self.receiver.try_recv() {
             // make sure we're ready for feeding
-            match <Batched::<FramedWrite<WriteHalf<Socket>, WsFrameCodec>, Frame> as SinkExt<Frame>>::poll_ready_unpin(
-                &mut self.stream,
-                cx,
-            )
-                .map_err(|err: WsWriteError| err.0)
+            match <Batched<FramedWrite<WriteHalf<Transport>, WsFrameCodec>, Frame> as SinkExt<
+                Frame,
+            >>::poll_ready_unpin(&mut self.stream, cx)
+            .map_err(|err: WsWriteError| err.0)
             {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
@@ -213,7 +212,7 @@ impl Sink<Message> for WebSocketWriteHalf {
         // introduces a sort of dos attack where the server spams
         // pings and we can't send any actual data in return.
 
-        <Batched::<FramedWrite<WriteHalf<Socket>, WsFrameCodec>, Frame> as SinkExt<Frame>>::poll_ready_unpin(
+        <Batched::<FramedWrite<WriteHalf<Transport>, WsFrameCodec>, Frame> as SinkExt<Frame>>::poll_ready_unpin(
             &mut self.stream,
             cx,
         )
@@ -224,7 +223,7 @@ impl Sink<Message> for WebSocketWriteHalf {
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
-        <Batched::<FramedWrite<WriteHalf<Socket>, WsFrameCodec>, Frame> as SinkExt<Frame>>::poll_flush_unpin(
+        <Batched::<FramedWrite<WriteHalf<Transport>, WsFrameCodec>, Frame> as SinkExt<Frame>>::poll_flush_unpin(
             &mut self.stream,
             cx,
         )
@@ -238,7 +237,7 @@ impl Sink<Message> for WebSocketWriteHalf {
         // this is not that undesired considering you can just call WebSocketWriteHalf::drop
         self.shutdown = true;
 
-        <Batched::<FramedWrite<WriteHalf<Socket>, WsFrameCodec>, Frame> as SinkExt<Frame>>::poll_close_unpin(
+        <Batched::<FramedWrite<WriteHalf<Transport>, WsFrameCodec>, Frame> as SinkExt<Frame>>::poll_close_unpin(
             &mut self.stream,
             cx,
         )

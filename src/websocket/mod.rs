@@ -4,7 +4,7 @@ mod handshake;
 pub mod message;
 pub mod ops;
 mod parsed_addr;
-mod socket;
+mod transport;
 pub mod split {
     mod read;
     pub use read::*;

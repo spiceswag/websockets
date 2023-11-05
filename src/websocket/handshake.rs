@@ -15,7 +15,7 @@ use sha1::{Digest, Sha1};
 
 use crate::WebSocketError;
 
-use super::{parsed_addr::ParsedAddr, socket::Socket};
+use super::{parsed_addr::ParsedAddr, transport::Transport};
 
 #[derive(Debug)]
 pub(super) struct Handshake {
@@ -48,7 +48,7 @@ impl Handshake {
     }
 
     /// Perform a WebSocket handshake on the given socket.
-    pub async fn send(&self, stream: Socket) -> Result<(Socket, Bytes), WebSocketError> {
+    pub async fn send(&self, stream: Transport) -> Result<(Transport, Bytes), WebSocketError> {
         let mut uri = self.addr.clone();
 
         let io = TokioIo::new(stream);
@@ -173,7 +173,8 @@ impl Handshake {
             .await
             .map_err(WebSocketError::HandshakeError)?;
 
-        let parts: Parts<TokioIo<Socket>> = upgraded.downcast().unwrap_or_else(|_| unreachable!());
+        let parts: Parts<TokioIo<Transport>> =
+            upgraded.downcast().unwrap_or_else(|_| unreachable!());
 
         let io = parts.io.into_inner();
         let buf = parts.read_buf;

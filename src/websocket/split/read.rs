@@ -14,7 +14,7 @@ use crate::{
     websocket::{
         frame::{Frame, FrameType, WsFrameCodec},
         message::{IncompleteMessage, MessageFragment},
-        socket::Socket,
+        transport::Transport,
     },
     Message, WebSocketError,
 };
@@ -23,7 +23,7 @@ use crate::{
 /// This half can only receive frames.
 #[derive(Debug)]
 pub struct WebSocketReadHalf {
-    stream: FramedRead<BufReader<ReadHalf<Socket>>, WsFrameCodec>,
+    stream: FramedRead<BufReader<ReadHalf<Transport>>, WsFrameCodec>,
 
     event_sender: Sender<Event>,
 
@@ -43,7 +43,7 @@ pub struct WebSocketReadHalf {
 
 impl WebSocketReadHalf {
     pub(crate) fn new(
-        stream: FramedRead<BufReader<ReadHalf<Socket>>, WsFrameCodec>,
+        stream: FramedRead<BufReader<ReadHalf<Transport>>, WsFrameCodec>,
         event_sender: Sender<Event>,
         pong_receiver: Receiver<oneshot::Sender<PingPayload>>,
     ) -> Self {
@@ -60,7 +60,7 @@ impl WebSocketReadHalf {
     pub(crate) fn into_parts(
         self,
     ) -> (
-        FramedRead<BufReader<ReadHalf<Socket>>, WsFrameCodec>,
+        FramedRead<BufReader<ReadHalf<Transport>>, WsFrameCodec>,
         Option<IncompleteMessage>,
         bool,
     ) {

@@ -124,35 +124,23 @@ impl ClosingFrames {
         } = self;
 
         if let Some(payload) = complete {
-            return Ok(CloseOutcome::Normal(payload));
+            return Ok(CloseOutcome::Normal(Some(payload)));
         }
 
         let wait_for_close = async move {
             loop {
                 match read.next().await {
-                    None => {
-                        return Ok::<CloseOutcome, WebSocketError>(CloseOutcome::Normal(
-                            ClosePayload {
-                                status: Status::MissingStatusCode,
-                                reason: None,
-                            },
-                        ))
-                    }
+                    None => return Ok::<CloseOutcome, WebSocketError>(CloseOutcome::Abrupt),
                     Some(Err(err)) => return Err(err.0),
                     Some(Ok(frame)) => match frame {
-                        Frame::Close { payload: None } => {
-                            return Ok(CloseOutcome::Normal(ClosePayload {
-                                status: Status::MissingStatusCode,
-                                reason: None,
-                            }))
-                        }
+                        Frame::Close { payload: None } => return Ok(CloseOutcome::Normal(None)),
                         Frame::Close {
                             payload: Some((status, reason)),
                         } => {
-                            return Ok(CloseOutcome::Normal(ClosePayload {
+                            return Ok(CloseOutcome::Normal(Some(ClosePayload {
                                 status: status.try_into()?,
                                 reason: Some(reason).filter(|s| !s.is_empty()),
-                            }))
+                            })))
                         }
                         _ => {}
                     },
@@ -274,11 +262,13 @@ impl Stream for ClosingFrames {
 #[derive(Debug, PartialEq, Eq)]
 pub enum CloseOutcome {
     /// The WebSocket connection was closed normally.
-    Normal(ClosePayload),
+    Normal(Option<ClosePayload>),
     /// The server took too long to reply with a `Close` frame,
     /// or took too long to shut down the TCP connection,
     /// so the client acted first.
     TimeOut,
+    /// Abrupt closure of the connection without any echoed `Close` frame.
+    Abrupt,
 }
 
 impl CloseOutcome {
@@ -286,11 +276,12 @@ impl CloseOutcome {
     ///
     /// # Panics
     ///
-    /// This method panics if `self` is equal to [`CloseOutcome::TimeOut`]
-    pub fn unwrap(self) -> ClosePayload {
+    /// This method panics if `self` is equal to [`CloseOutcome::TimeOut`] or [`CloseOutcome::Abrupt`]
+    pub fn unwrap(self) -> Option<ClosePayload> {
         match self {
             Self::Normal(p) => p,
             Self::TimeOut => panic!("unwrap called on a time out close outcome"),
+            Self::Abrupt => panic!("unwrap called on a abrupt closure close outcome"),
         }
     }
 }

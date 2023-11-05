@@ -41,7 +41,7 @@ use tokio::time::timeout;
 use self::{
     frame::Frame,
     message::Message,
-    ops::{CloseOutcome, ClosePayload, ClosingFrames, Pong, Status},
+    ops::{CloseOutcome, ClosePayload, ClosingFrames, Pong},
 };
 
 /// Manages the WebSocket connection; used to connect, send data, and receive data.
@@ -213,29 +213,17 @@ impl WebSocket {
         let timeout = timeout(Duration::from_secs(5), async move {
             loop {
                 match read.next().await {
-                    None => {
-                        return Ok::<CloseOutcome, WebSocketError>(CloseOutcome::Normal(
-                            ClosePayload {
-                                status: Status::MissingStatusCode,
-                                reason: None,
-                            },
-                        ))
-                    }
+                    None => return Ok::<CloseOutcome, WebSocketError>(CloseOutcome::Abrupt),
                     Some(Err(err)) => return Err(err.0),
                     Some(Ok(frame)) => match frame {
-                        Frame::Close { payload: None } => {
-                            return Ok(CloseOutcome::Normal(ClosePayload {
-                                status: Status::MissingStatusCode,
-                                reason: None,
-                            }))
-                        }
+                        Frame::Close { payload: None } => return Ok(CloseOutcome::Normal(None)),
                         Frame::Close {
                             payload: Some((status, reason)),
                         } => {
-                            return Ok(CloseOutcome::Normal(ClosePayload {
+                            return Ok(CloseOutcome::Normal(Some(ClosePayload {
                                 status: status.try_into()?,
                                 reason: Some(reason).filter(|s| !s.is_empty()),
-                            }))
+                            })))
                         }
                         _ => {}
                     },

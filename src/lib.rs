@@ -52,6 +52,8 @@ pub use websocket::{builder::WebSocketBuilder, WebSocket};
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use crate::{
         ops::{ClosePayload, Status},
         *,
@@ -111,7 +113,10 @@ mod tests {
 
     #[tokio::test]
     async fn close() {
-        let ws = WebSocket::connect("wss://ws.ifelse.io").await.unwrap();
+        let ws = WebSocket::connect("ws://ws.ifelse.io").await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
         let res = ws
             .close(Some(ClosePayload {
                 status: Status::Ok,
@@ -120,7 +125,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(res.unwrap().status, Status::Ok);
+        assert_eq!(res.unwrap().unwrap().status, Status::Ok);
     }
 
     #[tokio::test]

@@ -131,13 +131,16 @@ impl WebSocketWriteHalf {
     /// Performs a clean shutdown on the WebSocket connection by sending
     /// a `Close` frame with the desired payload.
     ///
-    /// This method completes when the server echoes the `Close` frame,
-    /// and closes the TCP connection, or if the server is too slow, we close it first.
+    /// This method does not close down the TCP stream.
+    /// To do that call [`drop`].
     ///
     /// This method will flush incoming events.
     /// See the documentation on the [`WebSocket`](WebSocket#splitting) type for more details
     /// about events.
-    pub async fn close(mut self, payload: Option<ClosePayload>) -> Result<(), WebSocketError> {
+    pub async fn send_close(
+        &mut self,
+        payload: Option<ClosePayload>,
+    ) -> Result<(), WebSocketError> {
         let payload = if let Some(payload) = payload {
             if !payload.status.sendable() {
                 return Err(WebSocketError::BadStatus);
@@ -156,9 +159,6 @@ impl WebSocketWriteHalf {
             .send(Frame::Close { payload })
             .await
             .map_err(|err| err.0)?;
-
-        // ensure no stuff can be sent
-        self.drop().await?;
 
         Ok(())
     }

@@ -207,8 +207,12 @@ impl WebSocket {
         self,
         payload: Option<ClosePayload>,
     ) -> Result<CloseOutcome, WebSocketError> {
-        self.inner.write.close(payload).await?;
-        let (mut read, _, _) = self.inner.read.into_parts();
+        let FlushingWs {
+            read, mut write, ..
+        } = self.inner;
+
+        write.send_close(payload).await?;
+        let (mut read, ..) = read.into_parts();
 
         let timeout = timeout(Duration::from_secs(5), async move {
             loop {
@@ -231,7 +235,11 @@ impl WebSocket {
             }
         });
 
-        timeout.await.ok().unwrap_or(Ok(CloseOutcome::TimeOut))
+        let ret = timeout.await.ok().unwrap_or(Ok(CloseOutcome::TimeOut));
+
+        write.drop().await?;
+
+        ret
     }
 
     /// Sends a Close frame over the WebSocket connection, constructed
@@ -240,10 +248,10 @@ impl WebSocket {
     /// This method returns a [`Stream`] that catches all frames sent by the server,
     /// after the client sends a `Close` frame.
     pub async fn close_catching(
-        self,
+        mut self,
         payload: Option<ClosePayload>,
     ) -> Result<ClosingFrames, WebSocketError> {
-        self.inner.write.close(payload).await?;
+        self.inner.write.send_close(payload).await?;
         Ok(ClosingFrames::new(self.inner.read))
     }
 

@@ -8,6 +8,7 @@ use tokio_native_tls::{TlsConnector as TokioTlsConnector, TlsStream};
 
 use crate::error::WebSocketError;
 
+/// An abstraction over a potentially TLS encoded TCP stream.
 #[derive(Debug)]
 pub(crate) enum Transport {
     Plain(TcpStream),
@@ -15,6 +16,7 @@ pub(crate) enum Transport {
 }
 
 impl Transport {
+    /// Performs a TLS handshake if the transport is plain TCP and yields a TLS stream.
     pub async fn into_tls(
         self,
         host: &str,
@@ -32,20 +34,6 @@ impl Transport {
             Self::Tls(_) => Ok(self),
         }
     }
-
-    // pub(super) fn get_ref(&self) -> &TcpStream {
-    //     match self {
-    //         Self::Plain(tcp_stream) => tcp_stream,
-    //         Self::Tls(tls_stream) => tls_stream.get_ref().get_ref().get_ref(),
-    //     }
-    // }
-
-    // pub(super) fn get_mut(&mut self) -> &mut TcpStream {
-    //     match self {
-    //         Self::Plain(tcp_stream) => tcp_stream,
-    //         Self::Tls(tls_stream) => tls_stream.get_mut().get_mut().get_mut(),
-    //     }
-    // }
 }
 
 impl AsyncRead for Transport {

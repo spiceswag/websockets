@@ -35,7 +35,7 @@ impl Message {
         }
     }
 
-    /// Returns the length of the stored application data in bytesa
+    /// Returns the length of the stored application data in bytes
     pub fn len(&self) -> usize {
         match self {
             Self::Text(string) => string.len(),
@@ -46,18 +46,18 @@ impl Message {
 
 /// A list of fragmentation strategies provided by the library with the common purpose
 /// of splitting up an already available whole [`Message`] into frames
-///
-/// **`Fragmentation::None`** is the strategy to use when you're sure you won't be tripping
-/// the server's upper limit on frame size, such as when identifying to the discord gateway,
-/// as at most your frame size will be 120 bytes.
-///
-/// **`Fragmentation::WithThreshold`** is appopriate for simple splitting of messages based on
-/// a length threshold and a maximum frame size which the library will try to fill as many frames with.
 #[derive(Debug)]
 pub enum Fragmentation {
+    /// This is the strategy to use when you're sure you won't be tripping the server's upper limit
+    /// on frame size, such as when identifying to the discord gateway, as at most your frame size will be 120 bytes.
     None,
+    /// This strategy is appropriate for simple splitting of messages based on a length threshold
+    /// and a maximum frame size which the library will try to fill as many frames with.
     WithThreshold {
+        /// The message size threshold over which the algorithm will kick into effect.
+        /// This value is independent of the `max_frame_size` below.
         threshold: usize,
+        /// Once the above threshold is reached, this is the frame size the splitting algorithm will target.
         max_frame_size: usize,
     },
 }
@@ -158,7 +158,7 @@ impl Fragmentation {
                     // create a stubby half frame from the remainder
                     let remainder = iter.remainder();
                     if !remainder.is_empty() {
-                        frames.push(Frame::Binary {
+                        frames.push(Frame::Text {
                             payload: remainder.to_owned(),
                             continuation: !is_first,
                             fin: true,

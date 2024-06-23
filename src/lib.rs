@@ -45,7 +45,7 @@ pub mod secure;
 mod websocket;
 
 pub use error::WebSocketError;
-pub use websocket::message::Message;
+pub use websocket::message::{Fragmentation, Message};
 pub use websocket::ops;
 pub use websocket::split::{WebSocketReadHalf, WebSocketWriteHalf};
 pub use websocket::{builder::WebSocketBuilder, WebSocket};

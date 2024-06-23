@@ -189,12 +189,10 @@ pub enum MessageFragment {
     ///
     /// # Split UTF-8
     ///
-    /// In the websocket protocol, peers are allowed to split UTF-8
-    /// scalars across frame boundaries.
+    /// In the websocket protocol, peers are allowed to split UTF-8 scalars across frame boundaries.
     ///
-    /// When such a frame with split unicode scalars is received,
-    /// the bytes of the scalar at the end of the frame are staggered
-    /// and appear at the start of the next frame.  
+    /// When such a frame with split unicode scalars is received, the bytes of the scalar at the end of the frame are staggered
+    /// and appear at the start of the next frame, in order to keep string correctness guarantees.
     ///
     /// https://datatracker.ietf.org/doc/html/rfc6455#section-5.6
     Text(String),

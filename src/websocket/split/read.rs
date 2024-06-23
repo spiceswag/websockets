@@ -36,9 +36,9 @@ pub struct WebSocketReadHalf {
     /// Should be `None` if the stream is being managed by a [`FragmentedMessage`]
     partial_message: Option<IncompleteMessage>,
 
-    /// If the stream is in the middle of receiving a fragmented message,
-    /// but the FragmentedMessage struct was dropped.
-    recovering: bool,
+    /// If the stream is in the middle of receiving a fragmented message.
+    /// Should this flag be `true` outside of [`FragmentedMessage`] code, it means it was dropped.
+    reading_fragmented: bool,
 }
 
 impl WebSocketReadHalf {
@@ -53,7 +53,7 @@ impl WebSocketReadHalf {
             pong_receiver,
             pongs: vec![],
             partial_message: None,
-            recovering: false,
+            reading_fragmented: false,
         }
     }
 
@@ -67,10 +67,10 @@ impl WebSocketReadHalf {
         let Self {
             stream,
             partial_message,
-            recovering,
+            reading_fragmented,
             ..
         } = self;
-        (stream, partial_message, recovering)
+        (stream, partial_message, reading_fragmented)
     }
 
     /// Receives a [`Message`] over the WebSocket connection.
@@ -121,18 +121,21 @@ impl Stream for WebSocketReadHalf {
 
         self.collect_pongs();
 
-        if self.recovering {
+        // message reading methods aren't used by ReadFragmented,
+        // so if the flag is set here it means that ReadFragmented was dropped,
+        // and the message it was reading is now lost.
+        if self.reading_fragmented {
             match &frame {
                 Frame::Text { fin, .. } => {
                     if *fin {
-                        self.recovering = false;
+                        self.reading_fragmented = false;
                     } else {
                         return Poll::Pending;
                     }
                 }
                 Frame::Binary { fin, .. } => {
                     if *fin {
-                        self.recovering = false;
+                        self.reading_fragmented = false;
                     } else {
                         return Poll::Pending;
                     }
@@ -228,11 +231,8 @@ impl WebSocketReadHalf {
     }
 }
 
-/// A [`Stream`] yielding the next message fragmented,
-/// as it is received from the remote peer.
-///
-/// Useful for large messages where it is more optimal to process it as it
-/// comes in, rather than all at once.
+/// A [`Stream`] yielding the next message fragmented, as it is received from the remote peer.
+/// Useful for large messages where it is more optimal to process it as it comes in, rather than all at once.
 ///
 /// # Data Loss
 ///
@@ -370,14 +370,6 @@ impl<'a> Stream for FragmentedMessage<'a> {
 impl<'a> FusedStream for FragmentedMessage<'a> {
     fn is_terminated(&self) -> bool {
         self.fin
-    }
-}
-
-impl<'a> Drop for FragmentedMessage<'a> {
-    fn drop(&mut self) {
-        if !self.fin {
-            self.read.recovering = true;
-        }
     }
 }
 
